@@ -21,7 +21,7 @@ from typing import Optional
 
 # ── Configuration ───────────────────────────────────────────────────────────
 
-GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts"
+GEMINI_TTS_MODEL = os.environ.get("DND_TTS_MODEL", "").strip() or "gemini-2.5-flash-preview-tts"
 GEMINI_TTS_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
     f"{GEMINI_TTS_MODEL}:generateContent"
@@ -38,6 +38,10 @@ VALID_VOICES = frozenset({
     "Charon", "Enceladus", "Fenrir", "Umbriel",
     # Female
     "Aoede", "Gacrux", "Kore", "Vindemiatrix", "Zephyr",
+    # Rest of the Gemini prebuilt catalog (usable from voices.json).
+    "Puck", "Leda", "Orus", "Callirrhoe", "Autonoe", "Iapetus", "Algieba", "Despina",
+    "Erinome", "Algenib", "Rasalgethi", "Laomedeia", "Achernar", "Alnilam", "Schedar",
+    "Pulcherrima", "Achird", "Zubenelgenubi", "Sadachbia", "Sadaltager", "Sulafat",
 })
 DEFAULT_VOICE = "Enceladus"
 
@@ -48,7 +52,20 @@ MAX_TEXT_CHARS = 2000
 
 # Request timeout — Gemini Flash TTS typical latency is 1-3s; we give it
 # substantial headroom for cold-start or transient slowness.
-DEFAULT_TIMEOUT = 30.0
+DEFAULT_TIMEOUT = 60.0
+
+
+# ── Engine selection ────────────────────────────────────────────────────────
+# DND_TTS_ENGINE=voicestudio routes speech to a local VoiceStudio server
+# (OpenAI-style /v1/audio/speech) instead of Google Gemini.
+ENGINE = (os.environ.get("DND_TTS_ENGINE", "").strip().lower() or "gemini")
+VOICESTUDIO_URL = os.environ.get("DND_VOICESTUDIO_URL", "http://127.0.0.1:3900").rstrip("/")
+VOICESTUDIO_KEY = os.environ.get("DND_VOICESTUDIO_KEY", "").strip()
+
+
+def engine_id() -> str:
+    """Identifies the engine+model for cache keys."""
+    return "voicestudio" if ENGINE == "voicestudio" else GEMINI_TTS_MODEL
 
 
 # ── Key resolution ──────────────────────────────────────────────────────────
@@ -72,6 +89,8 @@ def key_source() -> str:
 
     Used by the verify path and the /dnd load surface — does not return the key.
     """
+    if ENGINE == "voicestudio":
+        return "voicestudio"
     for env in ("DND_TTS_KEY", "GEMINI_API_KEY"):
         v = os.environ.get(env)
         if v and v.strip():
@@ -91,11 +110,14 @@ def synthesize_strict(
     text: str,
     voice: str = DEFAULT_VOICE,
     timeout: float = DEFAULT_TIMEOUT,
+    style: str = "",
 ) -> bytes:
     """Call Gemini Flash TTS and return raw L16 PCM bytes (24 kHz mono).
 
     Raises TtsError for any failure. Use synthesize() for the silent-fail path.
     """
+    if ENGINE == "voicestudio":
+        return _voicestudio_pcm(text, style, timeout=max(timeout, 300.0))
     key = _get_api_key()
     if not key:
         raise TtsError("no api key configured")
@@ -109,8 +131,10 @@ def synthesize_strict(
     if voice not in VALID_VOICES:
         voice = DEFAULT_VOICE
 
+    # Gemini TTS follows a plain-language direction placed before the text.
+    spoken = f"{style.strip()}:\n{text}" if style and style.strip() else text
     body = {
-        "contents": [{"role": "user", "parts": [{"text": text}]}],
+        "contents": [{"role": "user", "parts": [{"text": spoken}]}],
         "generationConfig": {
             "responseModalities": ["AUDIO"],
             "speechConfig": {
@@ -160,6 +184,92 @@ def synthesize_strict(
     if not pcm:
         raise TtsError("empty pcm payload")
     return pcm
+
+
+def _voicestudio_pcm(text: str, instruct: str, timeout: float = 300.0) -> bytes:
+    """Local VoiceStudio: designed voice from an `instruct` description.
+    Returns 24 kHz mono 16-bit PCM (what the browser player expects)."""
+    import io
+    import wave
+    text = (text or "").strip()[:MAX_TEXT_CHARS]
+    if not text:
+        raise TtsError("empty text")
+    body = {"model": "tts-1", "input": text, "voice": "alloy", "response_format": "wav"}
+    if instruct and instruct.startswith("profile:"):
+        body["voice"] = instruct.split(":", 1)[1].strip()
+        body["seed"] = 42
+        instruct = ""
+    if instruct and instruct.strip():
+        body["instruct"] = instruct.strip()
+        # Same description -> same seed -> the same voice every time (otherwise
+        # VoiceStudio designs a slightly different person on every request).
+        import zlib
+        body["seed"] = zlib.crc32(instruct.strip().lower().encode()) % 2_000_000_000
+    headers = {"Content-Type": "application/json"}
+    if VOICESTUDIO_KEY:
+        headers["Authorization"] = f"Bearer {VOICESTUDIO_KEY}"
+    req = urllib.request.Request(f"{VOICESTUDIO_URL}/v1/audio/speech",
+                                 data=json.dumps(body).encode(), headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        snippet = ""
+        try:
+            snippet = e.read().decode("utf-8", errors="replace")[:200]
+        except Exception:
+            pass
+        raise TtsError(f"voicestudio http {e.code}: {snippet}") from e
+    except Exception as e:
+        raise TtsError(f"voicestudio: {e}") from e
+    try:
+        with wave.open(io.BytesIO(raw)) as w:
+            ch, width, rate = w.getnchannels(), w.getsampwidth(), w.getframerate()
+            frames = w.readframes(w.getnframes())
+    except Exception as e:
+        raise TtsError(f"voicestudio: bad wav: {e}") from e
+    import audioop  # stdlib up to Python 3.12 (CT 103 runs 3.11)
+    if width != 2:
+        frames = audioop.lin2lin(frames, width, 2)
+    if ch == 2:
+        frames = audioop.tomono(frames, 2, 0.5, 0.5)
+    if rate != 24000:
+        frames, _ = audioop.ratecv(frames, 2, 1, rate, 24000, None)
+    if not frames:
+        raise TtsError("voicestudio: empty audio")
+    # Level every clip to the same, fairly quiet loudness (RMS target), so
+    # characters don't jump in volume and nothing blasts.
+    target = int(os.environ.get("DND_TTS_RMS", "1800"))
+    rms = audioop.rms(frames, 2)
+    if rms > 0:
+        gain = min(target / rms, 2.0)
+        peak = audioop.max(frames, 2)
+        if peak * gain > 30000:
+            gain = 30000 / peak
+        frames = audioop.mul(frames, 2, gain)
+    return frames
+
+
+def health(timeout: float = 2.0) -> dict:
+    """Is the voice engine reachable right now? {"engine", "up", "detail"}.
+
+    VoiceStudio: up when its HTTP server answers at all (any status code means
+    it is listening); connection refused / timeout means it is not running.
+    Gemini: up when an API key is configured (no network call)."""
+    if ENGINE == "voicestudio":
+        req = urllib.request.Request(f"{VOICESTUDIO_URL}/v1/models", method="GET")
+        if VOICESTUDIO_KEY:
+            req.add_header("Authorization", f"Bearer {VOICESTUDIO_KEY}")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout):
+                return {"engine": "voicestudio", "up": True, "detail": "ok"}
+        except urllib.error.HTTPError as e:
+            return {"engine": "voicestudio", "up": True, "detail": f"http {e.code}"}
+        except Exception as e:
+            reason = getattr(e, "reason", e)
+            return {"engine": "voicestudio", "up": False, "detail": str(reason)[:120]}
+    ok = key_source() != "unset"
+    return {"engine": "gemini", "up": ok, "detail": "key set" if ok else "no api key"}
 
 
 def synthesize(text: str, voice: str = DEFAULT_VOICE) -> Optional[bytes]:

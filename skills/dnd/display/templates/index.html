@@ -6,6 +6,37 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="dnd-token" content="{{ lan_token }}">
+<script>window.DND_ME = {{ (me or {})|tojson }};
+// Hosted table: your saved display settings come from your Discord account, so
+// they follow you to any device. Apply them before the page reads localStorage,
+// then mirror every later change back to the server.
+(function () {
+  var me = window.DND_ME || {};
+  if (!me.character && !me.name) return;
+  var prefs = me.prefs || {};
+  try { Object.keys(prefs).forEach(function (k) { localStorage.setItem(k, prefs[k]); }); } catch (e) {}
+  var KEYS = ["dnd-theme","dnd-skin","dnd-text-scale","dnd-narration-words","dnd-onscreen-dice",
+              "dnd_tts_auto","dnd_tts_voice","dnd-type-speed","dnd-sfx","dnd-controls-visible"];
+  var pending = {}, timer = null;
+  function flush() {
+    timer = null;
+    var body = pending; pending = {};
+    fetch("/prefs", { method: "POST", headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify(body), keepalive: true }).catch(function () {});
+  }
+  try {
+    var orig = Storage.prototype.setItem;
+    Storage.prototype.setItem = function (k, v) {
+      orig.apply(this, arguments);
+      if (this === window.localStorage && KEYS.indexOf(k) !== -1 && prefs[k] !== String(v)) {
+        prefs[k] = String(v); pending[k] = String(v);
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(flush, 600);
+      }
+    };
+  } catch (e) {}
+})();
+</script>
 <meta name="narrator-voice" content="{{ narrator_voice }}">
 <meta name="tts-available" content="{{ '1' if tts_available else '0' }}">
 
@@ -3580,6 +3611,152 @@
     background:var(--e-accent, #FF7A2D); color:var(--e-dice-text, #14110C); border-color:var(--e-accent, #FF7A2D); }
   body.input-only #phone-status.ps-sending{ opacity:.8; }
   body.input-only #phone-status.ps-resolving{ color:var(--e-accent, #FF7A2D); }
+
+  /* ── Hosted table (logged-in players) ───────────────────────────────── */
+  #seat-strip { display:flex; align-items:center; gap:10px; margin-left:auto; margin-right:12px;
+    font:11px/1.2 system-ui, sans-serif; letter-spacing:.03em; white-space:nowrap; min-width:0; }
+  #seat-strip a { color:rgba(201,162,74,.95); text-decoration:none; }
+  #seat-strip a:hover { text-decoration:underline; }
+  #seat-who { font-weight:600; overflow:hidden; text-overflow:ellipsis; color:inherit; }
+  #seat-mode { opacity:.7; margin-left:4px; }
+  body.hosted #dm-help-btn { display:none !important; }
+  body.hosted #phone-mode-btn { display:none !important; }
+  body.hosted .tts-voice-btn, body.hosted .tts-voice-menu { display:none !important; }
+  #ready-strip { margin-left:12px; font:600 11px/1.2 system-ui, sans-serif; color:#5f9a6a;
+    letter-spacing:.02em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+  #ready-strip:empty { display:none; }
+
+  /* Phones and narrow windows: story gets the full width; the stats sidebar
+     and settings column become solid overlays opened by their toggles. */
+  @media (max-width: 820px) {
+    #text-scroll, #text-scroll.sidebar-hidden, #text-scroll.controls-hidden,
+    #text-scroll.sidebar-hidden.controls-hidden { padding-left:16px; padding-right:16px; }
+    #sidebar { z-index:40; width:min(280px, 86vw); background:#0a0b10 !important; opacity:1 !important; backdrop-filter:none !important;
+      border-right:1px solid rgba(180,140,60,.3); }
+    #sidebar.hidden { transform:translateX(-110%); }
+    #audio-controls:not(.collapsed) { z-index:40; background:rgba(8,10,14,.97); padding:12px;
+      border:1px solid rgba(180,140,60,.3); border-radius:10px; opacity:1; max-width:calc(100vw - 32px); }
+    #new-content-pill, #text-scroll.sidebar-hidden ~ #new-content-pill { left:50%; }
+    #seat-strip { gap:8px; }
+    #seat-mode { display:none; }
+    /* Solid band behind the top controls so scrolled story text doesn't run under them. */
+    body:not(.input-only)::before { content:""; position:fixed; left:0; right:0; top:0; height:132px; z-index:5;
+      pointer-events:none; background:linear-gradient(to bottom, rgba(10,8,6,1) 0%, rgba(10,8,6,.96) 70%, rgba(10,8,6,0)); }
+    #text-scroll { padding-top:136px; }
+    /* Party stats on phones: a clear button that opens the full sidebar. */
+    #sidebar-toggle.visible { top:96px; left:12px; z-index:41; font:600 12px/1 system-ui, sans-serif;
+      letter-spacing:.06em; color:#e8dcc0; background:rgba(20,14,8,.92); border:1px solid rgba(201,162,74,.55);
+      border-radius:999px; padding:8px 14px; }
+    #sidebar { top:136px; bottom:72px; padding-top:12px; }
+  }
+
+  /* ── Hosted table: readability pass (players read on PCs/phones, not a TV) ── */
+  html body.hosted #sidebar .sb-identity { font-size:12px; color:rgba(225,210,175,.72); }
+  html body.hosted #sidebar .sb-label { font-size:10px; letter-spacing:1.5px; color:rgba(205,165,80,.8); }
+  html body.hosted #sidebar .sb-hp-nums { font-size:13px; color:rgba(235,220,185,.95); }
+  html body.hosted #sidebar .sb-xp-nums { font-size:11px; color:rgba(205,165,80,.8); }
+  html body.hosted #sidebar .sb-bar-track { height:5px; }
+  html body.hosted #sidebar .sb-quick-stats { font-size:12px; color:rgba(215,200,165,.75); line-height:1.75; }
+  html body.hosted #sidebar .sb-quick-stats span.val { color:rgba(240,225,190,.98); }
+  html body.hosted #sidebar .sb-condition-pill { font-size:9.5px; }
+  html body.hosted #sidebar .sb-factions-header,
+  html body.hosted #sidebar .sb-quests-header { font-size:10px; color:rgba(205,165,80,.7); }
+  html body.hosted #sidebar .sb-faction-name,
+  html body.hosted #sidebar .sb-quest-name { font-size:12px; color:rgba(225,210,175,.85); }
+  html body.hosted #sidebar .sb-faction-standing,
+  html body.hosted #sidebar .sb-quest-status { font-size:10px; }
+  html body.hosted #sidebar .sb-faction-item,
+  html body.hosted #sidebar .sb-quest-item { padding:3px 0; }
+  /* Click a quest to read more. */
+  .sb-quest-item.clickable { cursor:pointer; border-radius:4px; }
+  .sb-quest-item.clickable:hover { background:rgba(180,140,60,.08); }
+  .sb-quest-item.clickable .sb-quest-name::before { content:'▸  '; opacity:.6; }
+  .sb-quest-item.clickable.open .sb-quest-name::before { content:'▾  '; }
+  .sb-quest-detail { font-size:11.5px; line-height:1.45; color:rgba(215,200,165,.8); margin:2px 0 8px 12px;
+    padding:6px 8px; border-left:2px solid rgba(180,140,60,.4); background:rgba(180,140,60,.05); white-space:pre-wrap; }
+  /* Long quest/faction names wrap instead of being cut off with an ellipsis. */
+  html body.hosted #sidebar .sb-quest-name,
+  html body.hosted #sidebar .sb-faction-name { white-space:normal; overflow:visible; text-overflow:clip; line-height:1.35; }
+  html body.hosted #sidebar .sb-quest-item,
+  html body.hosted #sidebar .sb-faction-item { align-items:flex-start; }
+  html body.hosted #sidebar .sb-quest-status,
+  html body.hosted #sidebar .sb-faction-standing { flex-shrink:0; padding-top:2px; }
+  /* Settings column: always light-on-dark, because the backdrop stays dark in every theme. */
+  html body.hosted #audio-controls .audio-row .audio-label { font-size:10px; letter-spacing:1.4px;
+    color:rgba(225,190,110,.92); min-width:56px; }
+  html body.hosted #audio-controls .audio-row:hover .audio-label { color:rgba(250,222,140,1); }
+  html body.hosted #sidebar-toggle, html body.hosted #controls-toggle-row .audio-label {
+    color:rgba(205,165,80,.8); font-size:11px; }
+  html body.hosted #audio-controls .audio-row .speed-label,
+  html body.hosted #audio-controls .audio-row .narrate-label,
+  html body.hosted #audio-controls .audio-row .theme-label { font-size:9.5px; }
+  @media (min-width: 821px) {
+    html body.hosted #sidebar { width:250px; }
+    html body.hosted #text-scroll:not(.sidebar-hidden) { padding-left:280px; }
+  }
+  /* "Voices" status light in the audio controls. */
+  #voices-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px;
+    vertical-align:middle; background:#8a8170; box-shadow:0 0 0 1px rgba(0,0,0,.35); }
+  #voices-row.up #voices-dot { background:#5fbf5a; box-shadow:0 0 6px rgba(95,191,90,.8); }
+  #voices-row.down #voices-dot { background:#8a8170; }
+  /* Character voices unavailable (TTS server returned 502). */
+  #tts-offline { position:fixed; right:12px; bottom:12px; z-index:9999; max-width:min(340px, calc(100vw - 32px));
+    padding:8px 30px 8px 12px; border-radius:8px; font:12.5px/1.4 system-ui, sans-serif;
+    color:#f1dcc0; background:rgba(60,28,14,.92); border:1px solid rgba(210,120,70,.6);
+    box-shadow:0 4px 14px rgba(0,0,0,.4); }
+  #tts-offline button { position:absolute; top:4px; right:6px; background:none; border:none;
+    color:inherit; font-size:14px; cursor:pointer; opacity:.7; }
+  /* Your own actions waiting for the DM (hosted): edit or withdraw them. */
+  #my-queued { margin:2px 0 10px; padding:10px 12px; border-radius:8px;
+    border:1px solid rgba(120,190,80,.35); background:rgba(120,190,80,.06);
+    font:13px/1.45 system-ui, sans-serif; color:inherit; }
+  #my-queued .mq-title { font:600 11px/1.2 system-ui, sans-serif; letter-spacing:.08em; text-transform:uppercase;
+    color:rgba(140,200,100,.9); margin-bottom:6px; }
+  #my-queued .mq-item { display:flex; gap:8px; align-items:flex-start; padding:5px 0;
+    border-top:1px solid rgba(180,140,60,.15); }
+  #my-queued .mq-item:first-of-type { border-top:none; }
+  #my-queued .mq-text { flex:1; min-width:0; font-family:'EB Garamond', Georgia, serif; font-size:15px;
+    white-space:pre-wrap; word-break:break-word; }
+  #my-queued textarea { flex:1; min-width:0; font-family:'EB Garamond', Georgia, serif; font-size:15px;
+    background:rgba(0,0,0,.25); color:inherit; border:1px solid rgba(180,140,60,.5); border-radius:6px;
+    padding:6px 8px; resize:vertical; }
+  #my-queued .mq-actions { display:flex; gap:6px; flex-shrink:0; }
+  #my-queued button { font:600 12px/1 system-ui, sans-serif; padding:6px 10px; border-radius:6px; cursor:pointer;
+    background:transparent; color:inherit; border:1px solid rgba(180,140,60,.45); }
+  #my-queued button.mq-save { border-color:rgba(120,190,80,.7); color:rgba(150,215,110,.95); }
+  #my-queued button.mq-del:hover { border-color:rgba(200,100,80,.75); color:rgba(220,120,100,.95); }
+  #my-queued .mq-note { font-size:12px; opacity:.8; margin-top:6px; }
+  /* Group proposal (Everybody actions need everyone's OK). */
+  #proposal-card { margin:2px 0 12px; padding:12px 14px; border-radius:8px;
+    border:1px solid rgba(180,140,60,.45); background:rgba(180,140,60,.08);
+    font:13px/1.45 system-ui, sans-serif; color:inherit; }
+  #proposal-card .pc-title { font:600 11px/1.2 system-ui, sans-serif; letter-spacing:.08em; text-transform:uppercase;
+    color:rgba(180,140,60,.95); margin-bottom:6px; }
+  #proposal-card .pc-text { font-family:'EB Garamond', Georgia, serif; font-size:16px; margin:2px 0 8px;
+    padding-left:10px; border-left:2px solid rgba(180,140,60,.55); white-space:pre-wrap; }
+  #proposal-card .pc-by { font-size:11px; opacity:.7; margin-bottom:8px; }
+  #proposal-card ul { list-style:none; margin:0 0 10px; padding:0; display:grid; gap:3px; }
+  #proposal-card li.yes::before { content:"✓ "; color:#4f9a62; font-weight:700; }
+  #proposal-card li.no::before  { content:"✗ "; color:#c0563f; font-weight:700; }
+  #proposal-card li.wait::before{ content:"… "; opacity:.6; }
+  #proposal-card li .pc-note { opacity:.8; font-style:italic; }
+  #proposal-card .pc-actions { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  #proposal-card button { font:600 12px/1 system-ui, sans-serif; padding:7px 12px; border-radius:6px; cursor:pointer;
+    border:1px solid rgba(180,140,60,.6); background:transparent; color:inherit; }
+  #proposal-card button.pc-yes { background:#4f7a4f; border-color:#4f7a4f; color:#fff; }
+  #proposal-card button.pc-no  { border-color:#c0563f; color:#c0563f; }
+  #proposal-card input { flex:1 1 160px; min-width:0; font:13px system-ui, sans-serif; padding:6px 8px; border-radius:6px;
+    border:1px solid rgba(180,140,60,.4); background:rgba(255,255,255,.06); color:inherit; }
+  #proposal-card .pc-hint { font-size:11px; opacity:.65; margin-top:8px; }
+  #proposal-badge { margin-left:10px; font:600 11px/1.2 system-ui, sans-serif; color:#c08a2a; white-space:nowrap; }
+  /* Party input: friendlier send area. */
+  #input-hint { font:11px/1.3 system-ui, sans-serif; color:rgba(120,95,55,.75); margin-right:auto; align-self:center; }
+  #input-footer:has(#input-hint) { display:flex; gap:10px; }
+  @media (max-width: 820px) {
+    /* The scene title collided with the date on phones; the date and story already set the scene. */
+    body.hosted #scene-indicator { display:none; }
+    #input-hint { display:none; }
+  }
 </style>
 </head>
 <body>
@@ -3641,6 +3818,10 @@
   <div class="audio-row" id="narrate-row" title="Auto-narrate new blocks in this browser only" hidden>
     <span class="audio-label">Auto Narrate</span>
     <span id="narrate-label" class="narrate-label">Off</span>
+  </div>
+  <div class="audio-row" id="voices-row" title="Character voices (VoiceStudio). Grey = offline, the browser voice reads instead." hidden>
+    <span class="audio-label">Voices</span>
+    <span class="theme-label"><span id="voices-dot" aria-hidden="true"></span><span id="voices-label">Checking…</span></span>
   </div>
   <div class="audio-row" id="theme-row" title="Display theme — Dark / Light / Auto (system)">
     <span class="audio-label">Theme</span>
@@ -3727,6 +3908,15 @@
 <div id="input-panel" class="collapsed">
   <div id="input-panel-header">
     <span id="input-panel-label">Party Input</span>
+    <span id="ready-strip" aria-live="polite"></span>
+    <span id="proposal-badge" hidden></span>
+    {% if me %}
+    <span id="seat-strip" aria-label="Your seat">
+      <span id="seat-who">{{ me.character or me.name }}</span><span id="seat-mode"></span>
+      {% if me.owner %}<a href="/settings">Settings</a>{% endif %}
+      <a href="/logout">Log out</a>
+    </span>
+    {% endif %}
     <span id="input-badge"></span>
     <div id="autorun-indicator">
       <svg class="autorun-pie" viewBox="0 0 24 24" width="13" height="13">
@@ -3750,7 +3940,9 @@
     </div>
     <div id="phone-status" data-tab-section="move"></div>
     <div id="staged-queue" data-tab-section="move"></div>
+    <div id="my-queued" data-tab-section="move" style="display:none" aria-live="polite"></div>
     <div id="waiting-indicator" data-tab-section="move"></div>
+    <div id="proposal-card" data-tab-section="move" hidden></div>
     <div id="char-tabs" data-tab-section="move">
       <button class="char-tab active" data-char="Everybody">Everybody</button>
     </div>
@@ -3758,7 +3950,8 @@
               data-tab-section="move"></textarea>
     <div id="input-footer" data-tab-section="move">
       <button id="skip-turn-btn" style="display:none" title="Skip this character's turn">Skip Turn</button>
-      <button id="stage-btn">Stage</button>
+      {% if me %}<span id="input-hint">Enter to send · Shift+Enter for a new line</span>{% endif %}
+      <button id="stage-btn">{{ 'Send' if me else 'Stage' }}</button>
     </div>
     <!-- Phone-only dice pad (shown by ?view=input) -->
     <div id="dice-pad" data-tab-section="roll">
@@ -6248,6 +6441,7 @@ function updateStats(stats) {
     questPanel.querySelectorAll('.sb-quest-item').forEach(el => el.remove());
     if (quests.length) {
       const QCLS = { active:'active', threat:'threat', resolved:'resolved', failed:'failed' };
+      window._openQuests = window._openQuests || new Set();
       quests.forEach(q => {
         const item = document.createElement('div');
         item.className = 'sb-quest-item';
@@ -6260,6 +6454,26 @@ function updateStats(stats) {
         item.appendChild(nm);
         item.appendChild(st);
         questPanel.appendChild(item);
+        // Click a quest to read more about it (DM can send a "detail" text per quest).
+        const key = q.name || '';
+        const det = document.createElement('div');
+        det.className = 'sb-quest-detail';
+        det.textContent = q.detail || q.name || '';
+        det.hidden = !window._openQuests.has(key);
+        item.classList.add('clickable');
+        item.classList.toggle('open', !det.hidden);
+        item.setAttribute('role', 'button');
+        item.setAttribute('tabindex', '0');
+        item.setAttribute('aria-expanded', String(!det.hidden));
+        const toggle = () => {
+          det.hidden = !det.hidden;
+          item.classList.toggle('open', !det.hidden);
+          item.setAttribute('aria-expanded', String(!det.hidden));
+          if (det.hidden) window._openQuests.delete(key); else window._openQuests.add(key);
+        };
+        item.addEventListener('click', toggle);
+        item.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+        questPanel.appendChild(det);
       });
       questPanel.style.display = '';
     } else {
@@ -6441,9 +6655,13 @@ async function _playSfx(name) {
   });
 })();
 
+try {
+  if (localStorage.getItem('dnd-sfx') === '1') { _sfxOn = true; _setTrack(_sfxTrack, true); }
+} catch (_) {}
 document.getElementById('sfx-row').addEventListener('click', () => {
   _sfxOn = !_sfxOn;
   _setTrack(_sfxTrack, _sfxOn);
+  try { localStorage.setItem('dnd-sfx', _sfxOn ? '1' : '0'); } catch (_) {}
   try {
     fetch('/audio-toggle', {
       method: 'POST',
@@ -6461,11 +6679,19 @@ const _speedSteps = [
 ];
 let _speedIdx = 0;
 const _speedLabel = document.getElementById('speed-label');
-document.getElementById('speed-row').addEventListener('click', () => {
-  _speedIdx = (_speedIdx + 1) % _speedSteps.length;
+function _applySpeed(i) {
+  _speedIdx = i;
   const step = _speedSteps[_speedIdx];
   charDelay = step.ms;
   _speedLabel.textContent = step.label;
+}
+try {
+  const _savedSpeed = parseInt(localStorage.getItem('dnd-type-speed') || '', 10);
+  if (_savedSpeed >= 0 && _savedSpeed < _speedSteps.length) _applySpeed(_savedSpeed);
+} catch (_) {}
+document.getElementById('speed-row').addEventListener('click', () => {
+  _applySpeed((_speedIdx + 1) % _speedSteps.length);
+  try { localStorage.setItem('dnd-type-speed', String(_speedIdx)); } catch (_) {}
 });
 
 // ═══════════════════════════════════════════════════════════════════
@@ -6514,6 +6740,16 @@ if (_TTS_HAS_BROWSER) {
 function _ttsPickBrowserVoice() {
   const voices = speechSynthesis.getVoices() || [];
   if (!voices.length) return null;
+  // Storyteller voices first (local tweak): deep male narrators, Edge then Chrome.
+  const storytellers = [
+    /Ryan Online \(Natural\)/i, /Thomas Online \(Natural\)/i,
+    /Christopher Online \(Natural\)/i, /Guy Online \(Natural\)/i,
+    /Davis Online \(Natural\)/i, /Google UK English Male/i,
+  ];
+  for (const re of storytellers) {
+    const hit = voices.find(v => re.test(v.name));
+    if (hit) return hit;
+  }
   // Preference order: the page's declared language, then the browser's
   // accept-language chain, then English, then any voice at all -- a voice in
   // the wrong accent still beats silence. No single locale is hardcoded.
@@ -6580,7 +6816,8 @@ function _ttsBrowserSpeak(btn, text) {
     // Leave lang unset when no voice matched: the browser default is a better
     // guess than any locale this file could name.
     if (voice) { u.voice = voice; u.lang = voice.lang; }
-    u.rate = 0.95;
+    u.rate = 0.88;
+    u.pitch = 0.85;
     speechSynthesis.speak(u);
     last = u;
   });
@@ -6640,6 +6877,11 @@ function _ttsExtractText(blockEl) {
   const clone = blockEl.cloneNode(true);
   const bar = clone.querySelector('.tts-bar');
   if (bar) bar.remove();
+  const nm = clone.querySelector('.npc-name');
+  if (nm) nm.remove();
+  // Keep a space between paragraphs so the text matches what the server pre-generated.
+  clone.querySelectorAll('p, br, div').forEach(el => el.append(' '));
+  return (clone.textContent || '').replace(/[*_`]/g, '').replace(/\s+/g, ' ').trim().slice(0, 2000);
   return (clone.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 2000);
 }
 
@@ -6663,11 +6905,14 @@ async function _ttsPlayBlock(btn, blockEl) {
     const resp = await fetch('/tts', {
       method: 'POST',
       headers: _authHeaders(),
-      body: JSON.stringify({ text, voice: _ttsVoice }),
+      body: JSON.stringify({ text, voice: _ttsVoice,
+        speaker: (blockEl.classList.contains('npc-block') && blockEl.querySelector('.npc-name'))
+                 ? blockEl.querySelector('.npc-name').textContent.trim() : '' }),
     });
     if (!resp.ok) throw new Error('TTS ' + resp.status);
     const pcm = await resp.arrayBuffer();
     if (!pcm.byteLength) throw new Error('TTS empty');
+    _ttsShowOffline(false);
 
     await resumeP;
     if (ctx.state === 'suspended') await ctx.resume();
@@ -6705,6 +6950,7 @@ async function _ttsPlayBlock(btn, blockEl) {
       // Anything else (429, 502, a dropped connection) is transient: fall
       // back for this block and try the server again on the next one.
       if (err.message === 'TTS 503') _ttsServerOk = false;
+      if (err.message === 'TTS 502' || err.message === 'TTS 504') _ttsShowOffline(true);
       _ttsBrowserSpeak(btn, text);
       return;
     }
@@ -6724,49 +6970,51 @@ async function _ttsPlayBlock(btn, blockEl) {
   }
 }
 
-function _ttsSaveVoice(voice) {
-  _ttsVoice = voice;
-  localStorage.setItem('dnd_tts_voice', voice);
-  // Persist per-campaign on the server so a fresh page load lands on the same
-  // voice across browsers. Best-effort; UI never blocks on the response.
-  fetch('/voice', {
-    method: 'POST',
-    headers: _authHeaders(),
-    body: JSON.stringify({ voice }),
-  }).catch(() => {});
-  document.querySelectorAll('.tts-voice-opt').forEach(o => {
-    o.classList.toggle('tts-voice-active', o.dataset.voice === voice);
-  });
+// Tell the table when the character voices are down instead of silently
+// switching to the (much flatter) browser voice. Cleared on the next success.
+let _ttsOfflineDismissed = false;
+
+// "Voices" light: green = character voices online, grey = offline.
+function _voicesSetLight(up, detail) {
+  const row = document.getElementById('voices-row');
+  if (!row) return;
+  row.hidden = false;
+  row.classList.toggle('up', !!up);
+  row.classList.toggle('down', !up);
+  const lbl = document.getElementById('voices-label');
+  if (lbl) lbl.textContent = up ? 'Online' : 'Offline';
+  row.title = up ? 'Character voices are online.'
+                 : 'Character voices are offline' + (detail ? ' (' + detail + ')' : '') + '. The browser voice reads instead.';
+}
+async function _voicesPoll() {
+  try {
+    const r = await fetch('/tts/status', { headers: _authHeaders() });
+    if (!r.ok) return;
+    const d = await r.json();
+    _voicesSetLight(d.up, d.detail);
+  } catch (_) { /* page offline: leave the light as it is */ }
+}
+if (typeof _TTS_AVAILABLE !== 'undefined' && _TTS_AVAILABLE) {
+  setTimeout(_voicesPoll, 0);
+  setInterval(_voicesPoll, 30000);
 }
 
-function _ttsBuildVoiceMenu() {
-  const menu = document.createElement('div');
-  menu.className = 'tts-voice-menu';
-  menu.hidden = true;
-
-  function _addGroup(label, voices) {
-    const hdr = document.createElement('div');
-    hdr.className = 'tts-voice-group';
-    hdr.textContent = label;
-    menu.appendChild(hdr);
-    voices.forEach(v => {
-      const opt = document.createElement('button');
-      opt.className = 'tts-voice-opt';
-      opt.dataset.voice = v;
-      opt.textContent = v;
-      if (v === _ttsVoice) opt.classList.add('tts-voice-active');
-      opt.addEventListener('click', e => {
-        e.stopPropagation();
-        _ttsSaveVoice(v);
-        menu.hidden = true;
-      });
-      menu.appendChild(opt);
-    });
-  }
-  _addGroup('Male',   _TTS_VOICES_MALE);
-  _addGroup('Female', _TTS_VOICES_FEMALE);
-  return menu;
+function _ttsShowOffline(on) {
+  _voicesSetLight(!on);
+  let el = document.getElementById('tts-offline');
+  if (!on) { if (el) el.remove(); _ttsOfflineDismissed = false; return; }
+  if (el || _ttsOfflineDismissed) return;
+  el = document.createElement('div');
+  el.id = 'tts-offline';
+  el.setAttribute('role', 'status');
+  el.textContent = 'Character voices are offline right now, so the browser voice is reading instead.';
+  const x = document.createElement('button');
+  x.type = 'button'; x.textContent = '✕'; x.setAttribute('aria-label', 'Dismiss');
+  x.addEventListener('click', () => { _ttsOfflineDismissed = true; el.remove(); });
+  el.appendChild(x);
+  document.body.appendChild(el);
 }
+
 
 function _addTtsBar(blockEl) {
   if (!_TTS_AVAILABLE || !blockEl) return;
@@ -6782,22 +7030,8 @@ function _addTtsBar(blockEl) {
   playBtn.addEventListener('click', e => { e.stopPropagation(); _ttsPlayBlock(playBtn, blockEl); });
   bar.appendChild(playBtn);
 
-  const voiceBtn = document.createElement('button');
-  voiceBtn.className = 'tts-voice-btn';
-  voiceBtn.innerHTML = '<span class="tts-voice-label">Voices</span>' + _SVG_CHEVRON;
-  voiceBtn.setAttribute('aria-label', 'Select narrator voice');
-  bar.appendChild(voiceBtn);
-
-  const menu = _ttsBuildVoiceMenu();
-  bar.appendChild(menu);
-
-  voiceBtn.addEventListener('click', e => {
-    e.stopPropagation();
-    const wasHidden = menu.hidden;
-    document.querySelectorAll('.tts-voice-menu').forEach(m => { m.hidden = true; });
-    menu.hidden = !wasHidden;
-  });
-
+  // No per-block "Voices" picker: every character (and the narrator) has a
+  // fixed voice profile in voices.json, chosen on the server.
   blockEl.appendChild(bar);
 
   if (_ttsAutoNarrate) {
@@ -7029,7 +7263,8 @@ const _skipTurnBtn     = document.getElementById('skip-turn-btn');
 const _stagedQueueEl   = document.getElementById('staged-queue');
 const _waitingEl       = document.getElementById('waiting-indicator');
 
-let _selectedChar     = 'Everybody';
+let _selectedChar     = (window.DND_ME && window.DND_ME.character) ? window.DND_ME.character : 'Everybody';
+let _lastTabPlayers   = [];
 let _stagedData       = {};   // {char: {text, ready, timestamp}} — mirror of server state
 let _autorunThreshold = null; // null = use player count; int = explicit threshold
 
@@ -7041,7 +7276,17 @@ _inputPanelHdr.addEventListener('click', () => {
 
 // ── Build character tabs from stats players array ─────────────────
 function _buildCharTabs(players) {
-  const names = ['Everybody', ...(players || []).map(p => p.name).filter(Boolean)];
+  _lastTabPlayers = players || _lastTabPlayers || [];
+  let names = ['Everybody', ...(players || []).map(p => p.name).filter(Boolean)];
+  const _me = window.DND_ME || {};
+  if (_me.character) {
+    names = _me.together ? ['Everybody', _me.character] : [_me.character];
+    if (!names.includes(_selectedChar)) _selectedChar = _me.character;
+    const modeEl = document.getElementById('seat-mode');
+    if (modeEl) modeEl.textContent = _me.together ? '· together' : '· split up';
+    const whoEl = document.getElementById('seat-who');
+    if (whoEl) whoEl.textContent = _me.character;
+  }
   _charTabs.innerHTML = '';
   names.forEach(name => {
     const btn = document.createElement('button');
@@ -7236,12 +7481,113 @@ function _renderQueueStatus(chars) {
   if (!chars || chars.length === 0) {
     _waitingEl.style.display = 'none';
     _waitingEl.innerHTML = '';
+    const strip = document.getElementById('ready-strip');
+    if (strip) strip.textContent = '';
     return;
   }
   const checks = chars.map(c => `<span class="queue-check">✓ ${c}</span>`).join('');
-  _waitingEl.innerHTML = `<span class="queue-label">⏳ Queued — fires on DM Enter</span>${checks}`;
+  const _hostedLbl = document.body.classList.contains('hosted');
+  _waitingEl.innerHTML = `<span class="queue-label">${_hostedLbl ? '✓ Ready for the DM' : '⏳ Queued — fires on DM Enter'}</span>${checks}`;
   _waitingEl.style.display = 'block';
+  const strip = document.getElementById('ready-strip');
+  if (strip) strip.textContent = chars.map(c => '✓ ' + c.split(' ')[0]).join('  ');
 }
+
+// ── Your own actions waiting for the DM (hosted) ─────────────────
+// Lists the logged-in player's queued actions with Edit / ✕ so they can be
+// changed or withdrawn until the DM picks them up (check_input.py).
+const _myQueuedEl = document.getElementById('my-queued');
+let _myQueuedEditing = null;   // line index being edited, or null
+let _myQueuedNote = '';
+
+async function _loadMyQueued() {
+  if (!_myQueuedEl || !(window.DND_ME && window.DND_ME.character)) return;
+  if (_myQueuedEditing !== null) return;   // never yank the editor away mid-typing
+  try {
+    const r = await fetch('/player-input/mine', { headers: _authHeaders() });
+    if (!r.ok) { _myQueuedEl.style.display = 'none'; return; }
+    const d = await r.json();
+    _renderMyQueued(d.items || []);
+  } catch (_) { /* offline: keep what is shown */ }
+}
+
+function _renderMyQueued(items) {
+  _myQueuedEl.innerHTML = '';
+  if (!items.length && !_myQueuedNote) { _myQueuedEl.style.display = 'none'; return; }
+  _myQueuedEl.style.display = 'block';
+  const title = document.createElement('div');
+  title.className = 'mq-title';
+  title.textContent = items.length === 1 ? 'Your action, waiting for the DM'
+                                         : `Your actions, waiting for the DM (${items.length})`;
+  if (items.length) _myQueuedEl.appendChild(title);
+
+  items.forEach(it => {
+    const row = document.createElement('div');
+    row.className = 'mq-item';
+    const acts = document.createElement('div');
+    acts.className = 'mq-actions';
+    const btn = (label, cls, fn, aria) => {
+      const b = document.createElement('button');
+      b.type = 'button'; b.textContent = label; if (cls) b.className = cls;
+      if (aria) b.setAttribute('aria-label', aria);
+      b.addEventListener('click', fn); acts.appendChild(b); return b;
+    };
+
+    if (_myQueuedEditing === it.i) {
+      const ta = document.createElement('textarea');
+      ta.rows = 2; ta.maxLength = 500; ta.value = it.text;
+      ta.addEventListener('keydown', e => {
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); _saveMyQueued(it, ta.value); }
+        if (e.key === 'Escape') { _myQueuedEditing = null; _loadMyQueued(); }
+      });
+      row.appendChild(ta);
+      btn('Save', 'mq-save', () => _saveMyQueued(it, ta.value));
+      btn('Cancel', '', () => { _myQueuedEditing = null; _loadMyQueued(); });
+      row.appendChild(acts);
+      _myQueuedEl.appendChild(row);
+      setTimeout(() => { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }, 0);
+      return;
+    }
+    const txt = document.createElement('div');
+    txt.className = 'mq-text';
+    txt.textContent = it.text;
+    row.appendChild(txt);
+    btn('Edit', '', () => { _myQueuedEditing = it.i; _myQueuedNote = ''; _renderMyQueued(items); });
+    btn('✕', 'mq-del', () => {
+      if (confirm('Take this action back? The DM will not see it.')) _saveMyQueued(it, '');
+    }, 'Withdraw this action');
+    row.appendChild(acts);
+    _myQueuedEl.appendChild(row);
+  });
+
+  if (_myQueuedNote) {
+    const n = document.createElement('div');
+    n.className = 'mq-note';
+    n.textContent = _myQueuedNote;
+    _myQueuedEl.appendChild(n);
+  }
+}
+
+async function _saveMyQueued(it, text) {
+  text = (text || '').trim();
+  if (text === it.text) { _myQueuedEditing = null; _loadMyQueued(); return; }
+  let note = '';
+  try {
+    const r = await fetch('/player-input/edit', {
+      method: 'POST', headers: _authHeaders(),
+      body: JSON.stringify({ i: it.i, old: it.text, text }),
+    });
+    if (r.status === 409) note = 'Too late, the DM already has this action.';
+    else if (!r.ok) note = `Could not save (${r.status}). Try again.`;
+    else note = text ? 'Saved.' : 'Withdrawn.';
+  } catch (_) { note = 'Could not save (offline). Try again.'; }
+  _myQueuedEditing = null;
+  _myQueuedNote = note;
+  await _loadMyQueued();
+  setTimeout(() => { if (_myQueuedNote === note) { _myQueuedNote = ''; _loadMyQueued(); } }, 4000);
+}
+
+setTimeout(_loadMyQueued, 0);
 
 // ── Handle staged_inputs SSE event ───────────────────────────────
 function _handleStagedInputs(data) {
@@ -7347,11 +7693,72 @@ _skipTurnBtn.addEventListener('click', () => _skipTurn(_selectedChar));
 
 // Ctrl/Cmd+Enter stages from textarea
 _inputText.addEventListener('keydown', e => {
-  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+  const hosted = document.body.classList.contains('hosted');
+  if (e.key === 'Enter' && !e.isComposing &&
+      ((e.ctrlKey || e.metaKey) || (hosted && !e.shiftKey))) {
     e.preventDefault();
     _stageAction();
   }
 });
+// ── Group proposal card (hosted table) ─────────────────────────────
+window._renderProposal = function (p) {
+  const card = document.getElementById('proposal-card');
+  const badge = document.getElementById('proposal-badge');
+  if (!card) return;
+  const me = (window.DND_ME && window.DND_ME.character) || '';
+  if (!p) { card.hidden = true; card.textContent = ''; if (badge) badge.hidden = true; return; }
+  const mk = (tag, cls, text) => { const el = document.createElement(tag); if (cls) el.className = cls; if (text != null) el.textContent = text; return el; };
+  card.textContent = '';
+  card.appendChild(mk('div', 'pc-title', 'Group action: needs everyone\u2019s OK'));
+  card.appendChild(mk('div', 'pc-text', p.text));
+  card.appendChild(mk('div', 'pc-by', 'Proposed by ' + p.by));
+  const ul = mk('ul');
+  (p.required || []).forEach(c => {
+    const v = (p.votes || {})[c];
+    const li = mk('li', v ? (v.vote === 'yes' ? 'yes' : 'no') : 'wait');
+    li.appendChild(document.createTextNode(c + (v ? (v.vote === 'yes' ? ' agrees' : ' disagrees') : ' hasn\u2019t voted')));
+    if (v && v.vote === 'no' && v.note) { li.appendChild(document.createTextNode(': ')); li.appendChild(mk('span', 'pc-note', '\u201c' + v.note + '\u201d')); }
+    ul.appendChild(li);
+  });
+  card.appendChild(ul);
+  const mine = (p.votes || {})[me];
+  const acts = mk('div', 'pc-actions');
+  const send = (url, body) => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    .then(r => { if (!r.ok) r.text().then(t => { const h = card.querySelector('.pc-hint'); if (h) h.textContent = t; }); }).catch(() => {});
+  if ((p.required || []).includes(me)) {
+    const yes = mk('button', 'pc-yes', mine && mine.vote === 'yes' ? 'Agreed \u2713' : 'Agree');
+    yes.type = 'button';
+    yes.onclick = (e) => { e.stopPropagation(); send('/proposal/vote', { id: p.id, vote: 'yes' }); };
+    const note = mk('input'); note.placeholder = 'Why not? (optional)'; note.maxLength = 200;
+    note.onclick = e => e.stopPropagation();
+    const no = mk('button', 'pc-no', 'Disagree'); no.type = 'button';
+    no.onclick = (e) => { e.stopPropagation(); send('/proposal/vote', { id: p.id, vote: 'no', note: note.value }); };
+    acts.appendChild(yes); acts.appendChild(no); acts.appendChild(note);
+  }
+  if (p.by === me || (window.DND_ME && window.DND_ME.owner)) {
+    const wd = mk('button', '', 'Withdraw'); wd.type = 'button';
+    wd.onclick = (e) => { e.stopPropagation(); send('/proposal/withdraw', { id: p.id }); };
+    acts.appendChild(wd);
+  }
+  card.appendChild(acts);
+  card.appendChild(mk('div', 'pc-hint', 'Want a different plan? Pick Everybody, write it and send. It replaces this one and everyone votes again.'));
+  card.hidden = false;
+  if (badge) {
+    const waiting = (p.required || []).filter(c => !((p.votes || {})[c] && p.votes[c].vote === 'yes'));
+    badge.textContent = (mine && mine.vote === 'yes') ? ('\u23f3 Waiting on ' + waiting.map(c => c.split(' ')[0]).join(', '))
+                                                    : '\ud83d\uddf3 Your vote is needed';
+    badge.hidden = false;
+  }
+};
+
+// Hosted table: placeholder names your character; on bigger screens the input starts open.
+if (window.DND_ME && window.DND_ME.character) {
+  _inputText.placeholder = 'What does ' + window.DND_ME.character.split(' ')[0] + ' do or say?';
+  if (!(window.matchMedia && window.matchMedia('(max-width: 820px)').matches)) {
+    _inputPanel.classList.remove('collapsed');
+    _inputArrow.textContent = '▼';
+  }
+}
 
 // ── Keep the reading column clear of the fixed PARTY INPUT panel ──────
 // #input-panel is position:fixed at the bottom; when it expands (or the
@@ -7580,7 +7987,7 @@ function _setSidebarVisible(visible) {
   } else {
     _sidebar.classList.add('hidden');
     _textScroll.classList.add('sidebar-hidden');
-    _sidebarBtn.textContent = '▶ Stats';
+    _sidebarBtn.textContent = '▶ Party';
   }
 }
 
@@ -7607,6 +8014,14 @@ if (_controlsBtn) {
   _controlsBtn.addEventListener('click', () => _setControlsVisible(!_controlsVisible));
   try { if (localStorage.getItem('dnd-controls-visible') === '0') _setControlsVisible(false); } catch (e) {}
 }
+if (window.DND_ME && window.DND_ME.character) document.body.classList.add('hosted');
+// Narrow screens start with both side panels closed so the story is readable.
+if (window.matchMedia && window.matchMedia('(max-width: 820px)').matches) {
+  _setSidebarVisible(false);
+  if (_controlsBtn) _setControlsVisible(false);
+}
+// Seat strip links live inside the clickable panel header: don't toggle the panel.
+document.querySelectorAll('#seat-strip a').forEach(a => a.addEventListener('click', e => e.stopPropagation()));
 
 // Toggle button becomes visible once sidebar has data (called from SSE handler)
 
@@ -7643,6 +8058,14 @@ function connect() {
       _updateDicePendingBadge(payload.dice_pending);
     }
 
+    if (payload.proposal !== undefined && typeof window._renderProposal === 'function') {
+      window._renderProposal(payload.proposal);
+    }
+    if (payload.party_mode && window.DND_ME && window.DND_ME.character) {
+      window.DND_ME.together = !!payload.party_mode.together;
+      _buildCharTabs(_lastTabPlayers);
+    }
+
     if (payload.stats) {
       updateStats(payload.stats);
       if (payload.stats.players && payload.stats.players.length > 0) {
@@ -7662,6 +8085,7 @@ function connect() {
     }
     if (payload.queue_status !== undefined) {
       _renderQueueStatus(payload.queue_status);
+      _loadMyQueued();
     }
     if (payload.dm_processing) {
       _showProcessingIndicator();

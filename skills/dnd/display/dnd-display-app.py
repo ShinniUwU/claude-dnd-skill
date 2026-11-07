@@ -31,7 +31,7 @@ import sys
 import threading
 from collections import deque
 from typing import Optional
-from flask import Flask, Response, request, render_template, jsonify, send_from_directory
+from flask import Flask, Response, request, render_template, jsonify, send_from_directory, g
 from flask_cors import CORS
 
 # This file lives at <code-root>/display/ — resolve dirs from its location so
@@ -372,6 +372,151 @@ def _staged_snapshot() -> dict:
     return {k: {"text": v["text"], "ready": v["ready"]} for k, v in _staged.items()}
 
 
+# Serialises every write to .input_queue made by this app (enqueue + edits).
+# check_input.py on the DM machine reads and deletes the file; edits re-check
+# the exact line before changing it, so a line the DM already took is never
+# "edited" after the fact.
+_queue_file_lock = threading.Lock()
+_QUEUE_LINE_RE = re.compile(r"^\[([^\]]+)\]: (.*)$")
+
+
+def _queue_read_lines() -> "list[str]":
+    try:
+        with open(QUEUE_FILE, encoding="utf-8") as f:
+            return [ln for ln in f.read().split("\n") if ln.strip()]
+    except FileNotFoundError:
+        return []
+
+
+# Changing the queue = take the file by renaming it to .hold, change it, put
+# it back. check_input.py (DM machine) also takes it by rename, so the two can
+# never both hold it: whoever renames first wins, the other sees it missing.
+QUEUE_HOLD = QUEUE_FILE + ".hold"
+
+
+def _queue_take() -> "list[str] | None":
+    """Take the queue for changing. None = no queue file (DM took it or empty)."""
+    try:
+        os.replace(QUEUE_FILE, QUEUE_HOLD)
+    except FileNotFoundError:
+        return None
+    with open(QUEUE_HOLD, encoding="utf-8") as f:
+        return [ln for ln in f.read().split("\n") if ln.strip()]
+
+
+def _queue_put(lines: "list[str]") -> None:
+    """Put the (changed) queue back, or drop it when empty."""
+    if lines:
+        tmp = QUEUE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        os.replace(tmp, QUEUE_FILE)
+    try:
+        os.remove(QUEUE_HOLD)
+    except FileNotFoundError:
+        pass
+
+
+def _hosted_enqueue(items: "list[tuple[str, str]]", extra: "dict | None" = None) -> None:
+    """Append [Character]: text lines to the DM queue and show a check for each."""
+    new_lines = [f"[{c}]: {t}" for c, t in items]
+    with _queue_file_lock:
+        _queue_put((_queue_take() or []) + new_lines)
+    with _queue_status_lock:
+        for c, _t in items:
+            if c not in _queue_status:
+                _queue_status.append(c)
+        qs = list(_queue_status)
+    payload = {"queue_status": qs}
+    if extra:
+        payload.update(extra)
+    _broadcast(payload)
+
+
+# ─── Group proposals (hosted): an "Everybody" action needs everyone's OK ────
+# A player who sends something as "Everybody" creates a proposal every player
+# can see. It only reaches the DM once every seated character has agreed.
+# Sending a new Everybody action replaces the proposal and resets the votes.
+PROPOSAL_FILE = rt("proposal.json")
+_proposal: "dict | None" = None
+_proposal_lock = threading.Lock()
+
+
+def _proposal_required() -> "list[str]":
+    """Characters whose agreement is needed: party members someone is playing."""
+    with _stats_lock:
+        names = [p.get("name", "") for p in _current_stats.get("players", []) if p.get("name")]
+    try:
+        seated = {(u.get("character") or "").strip().lower()
+                  for u in _auth.load_access()["users"].values()}
+    except Exception:
+        seated = set()
+    req = [n for n in names if n.lower() in seated]
+    return req or names
+
+
+def _proposal_view() -> "dict | None":
+    with _proposal_lock:
+        if not _proposal:
+            return None
+        p = dict(_proposal)
+        p["votes"] = {k: dict(v) for k, v in _proposal["votes"].items()}
+    p["required"] = _proposal_required()
+    return p
+
+
+def _persist_proposal() -> None:
+    try:
+        with _proposal_lock:
+            data = _proposal
+        with open(PROPOSAL_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+def _load_proposal() -> None:
+    global _proposal
+    try:
+        with open(PROPOSAL_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and data.get("text"):
+            _proposal = data
+    except Exception:
+        pass
+
+
+def _proposal_changed() -> None:
+    _persist_proposal()
+    _broadcast({"proposal": _proposal_view()})
+
+
+def _proposal_try_send() -> bool:
+    """Send the proposal to the DM if every required character agreed."""
+    global _proposal
+    req = _proposal_required()
+    with _proposal_lock:
+        if not _proposal:
+            return False
+        votes = _proposal["votes"]
+        if not all(votes.get(c, {}).get("vote") == "yes" for c in req):
+            return False
+        text = _proposal["text"]
+        _proposal = None
+    _hosted_enqueue([("Everybody", text)])
+    _proposal_changed()
+    return True
+
+
+def _proposal_clear() -> None:
+    global _proposal
+    with _proposal_lock:
+        had = _proposal is not None
+        _proposal = None
+    if had:
+        _proposal_changed()
+
+
 def _check_auto_trigger() -> None:
     """Move staged-and-ready actions into the DM-gated queue file (.input_queue).
 
@@ -379,6 +524,20 @@ def _check_auto_trigger() -> None:
     time the DM presses Enter (or Claude explicitly triggers via .input_trigger).
     This gives the DM control over when player actions enter Claude's context.
     """
+    if _HOSTED:
+        # Hosted table: every submitted action is queued on its own, straight
+        # away, and appended so nothing overwrites anything. Everyone sees a
+        # check next to each character who has submitted (names only).
+        with _staged_lock:
+            ready = [(c, e) for c, e in _staged.items() if e["ready"]]
+            for c, _e in ready:
+                _staged.pop(c, None)
+            snap = _staged_snapshot()
+        if not ready:
+            return
+        _hosted_enqueue([(c, e["text"]) for c, e in ready], extra={"staged_inputs": snap})
+        return
+
     with _staged_lock:
         if not _staged:
             return
@@ -394,8 +553,12 @@ def _check_auto_trigger() -> None:
         _staged.clear()
 
     try:
+        try:
+            prev = open(QUEUE_FILE, encoding="utf-8").read().rstrip("\n")
+        except FileNotFoundError:
+            prev = ""
         with open(QUEUE_FILE, "w", encoding="utf-8") as f:
-            f.write(content)
+            f.write((prev + "\n" if prev else "") + content)
     except Exception:
         char_names = []
 
@@ -406,8 +569,22 @@ def _check_auto_trigger() -> None:
     _broadcast({"staged_inputs": {}, "queue_status": list(char_names)})
 
 
+# Hosted multiplayer mode (velvetcore fork): Discord login + per-character privacy.
+_HOSTED = bool(os.environ.get("DND_OWNER_ID", "").strip())
+
+if _HOSTED:
+    # Restore the "ready" checks after a restart from what is still queued,
+    # so players don't think their submitted actions were lost.
+    for _ln in _queue_read_lines():
+        _m = _QUEUE_LINE_RE.match(_ln)
+        if _m and _m.group(1) not in _queue_status:
+            _queue_status.append(_m.group(1))
+
+
 def _token_ok() -> bool:
     """Return True if the request carries the correct LAN token (or we're in localhost mode)."""
+    if _HOSTED:
+        return _auth.token_ok()
     if _lan_token is None:
         return True   # localhost mode — no token required
     provided = request.headers.get("X-DND-Token", "")
@@ -417,7 +594,12 @@ def _token_ok() -> bool:
 app = Flask(__name__)
 
 app.config['TEMPLATES_AUTO_RELOAD'] = True
-CORS(app)
+if _HOSTED:
+    # Behind Caddy: trust one proxy hop so rate limits see real client IPs.
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+else:
+    CORS(app)
 
 # Wire audio broadcast after _broadcast is defined (see bottom of file)
 # — done lazily via set_broadcast() called after app is created.
@@ -910,6 +1092,9 @@ _clients_lock = threading.Lock()
 # Lets a dice-request know whether a target PC has a live phone (→ route there)
 # or not (→ open the on-screen roller). Guarded by _clients_lock.
 _client_chars: "dict[queue.Queue, str]" = {}
+# Hosted mode: SSE client -> the logged-in viewer's character (lowercase), used
+# to filter private blocks. Guarded by _clients_lock.
+_client_viewer: "dict[queue.Queue, str]" = {}
 
 
 def _phone_present(char: str) -> bool:
@@ -1176,13 +1361,35 @@ def _broadcast(payload: dict) -> None:
     with _clients_lock:
         dead = []
         for q in _clients:
+            p = payload
+            if _HOSTED:
+                p = _auth.filter_for(payload, _client_viewer.get(q))
+                if p is None:
+                    continue
             try:
-                q.put_nowait(payload)
+                q.put_nowait(p)
             except queue.Full:
                 dead.append(q)
         for q in dead:
             _clients.remove(q)
             _client_chars.pop(q, None)
+            _client_viewer.pop(q, None)
+
+
+if _HOSTED:
+    import auth_ext as _auth
+
+    def _known_characters() -> "list[str]":
+        with _stats_lock:
+            return [p.get("name", "") for p in _current_stats.get("players", []) if p.get("name")]
+
+    _auth.init(app, lambda: _lan_token, _broadcast, _known_characters)
+
+    def _on_party_change(together: bool) -> None:
+        if not together:
+            _proposal_clear()   # a split party can't act as one
+    _auth.on_party_change = _on_party_change
+    _load_proposal()
 
 
 # ─── Routes ──────────────────────────────────────────────────────────────────
@@ -1192,7 +1399,8 @@ def index():
     # Pass LAN token to template so the browser can authenticate /help-request
     return render_template(
         "index.html",
-        lan_token=_lan_token or "",
+        lan_token="" if _HOSTED else (_lan_token or ""),
+        me=(_auth.me_payload() if _HOSTED else {}),
         narrator_voice=_read_narrator_voice(),
         tts_available=(_tts is not None),
     )
@@ -1322,6 +1530,12 @@ def chunk():
     is_milestone_spend = bool(data.get("milestone_spend"))
     is_xp_award    = bool(data.get("xp_award"))
 
+    _aud = None
+    if _HOSTED:
+        with _stats_lock:
+            _kp = [p.get("name", "") for p in _current_stats.get("players", []) if p.get("name")]
+        _aud = _auth.audience(data, str(raw), _kp)
+
     # ── Milestone award/spend (stack-based reward, distinct from binary Inspiration) ──
     if is_milestone_award or is_milestone_spend:
         name = str(data.get("milestone_award") or data.get("milestone_spend") or "").strip()[:80]
@@ -1333,6 +1547,8 @@ def chunk():
             "label": label,
             "text": name,
         }
+        if _aud:
+            payload["to"] = _aud
         log_entry: dict = dict(payload)
         if is_milestone_award and data.get("reason"):
             payload["reason"] = str(data["reason"]).strip()[:240]
@@ -1354,6 +1570,8 @@ def chunk():
         reason = str(data.get("reason", "")).strip()[:240]
         payload: dict = {"inspiration_award": name, "text": name}
         log_entry: dict = {"inspiration_award": name, "text": name}
+        if _aud:
+            payload["to"] = log_entry["to"] = _aud
         if reason:
             payload["reason"] = reason
             log_entry["reason"] = reason
@@ -1385,6 +1603,8 @@ def chunk():
             return "", 204
         payload = {"xp_award": xp_data, "text": xp_data.get("summary", "")}
         log_entry = {"xp_award": xp_data, "text": xp_data.get("summary", "")}
+        if _aud:
+            payload["to"] = log_entry["to"] = _aud
         with _text_log_lock:
             _text_log.append(log_entry)
         with _tail_lock:
@@ -1397,6 +1617,11 @@ def chunk():
     # Player/npc/dice/tutor/action text comes from send.py (no ANSI/chrome) — light clean only.
     # DM narration may come from wrapper.py — full clean.
     cleaned = raw.strip() if (is_action or is_player or is_npc or is_dice or is_tutor) else _clean(raw)
+    # {Name} speaker tags (narration + NPC blocks) only steer TTS voices:
+    # remember them, then show/log/broadcast the text without them.
+    tts_text = cleaned
+    if not (is_action or is_player or is_dice or is_tutor):
+        cleaned = _tts_remember_tags(cleaned)
     if not cleaned.strip():
         return "", 204
 
@@ -1435,6 +1660,13 @@ def chunk():
         log_entry["dice"] = True
     elif is_tutor:
         log_entry["tutor"] = True
+
+    if _aud:
+        payload["to"] = _aud
+        log_entry["to"] = _aud
+
+    if not (is_action or is_player or is_dice or is_tutor):
+        _tts_prefetch(tts_text, str(data.get("npc") or "") if is_npc else "")
 
     # Stamp campaign on tail entries to prevent bleed when switching campaigns
     try:
@@ -1933,6 +2165,344 @@ def _write_narrator_voice(voice: str) -> bool:
         return False
 
 
+def _tts_norm(text: str) -> str:
+    """Normalise text the same way for the browser request and the prefetcher,
+    so both land on the same cache entry."""
+    t = re.sub(r"[*_`]", "", text or "")
+    t = re.sub(r"\s+", " ", t).strip()
+    return t[: (_tts.MAX_TEXT_CHARS if _tts else 2000)]
+
+
+def _tts_pick(speaker: str, req_voice: str = "") -> "tuple[str, str]":
+    """Return (voice, style) for a block, using voices.json when present."""
+    voice = req_voice if (req_voice and req_voice in _tts.VALID_VOICES) else _tts.DEFAULT_VOICE
+    style = ""
+    # VoiceStudio designs the voice from "instruct"; Gemini follows "style".
+    skey = "instruct" if getattr(_tts, "ENGINE", "") == "voicestudio" else "style"
+
+    def _sval(entry: dict) -> str:
+        # VoiceStudio: a saved, cloned voice profile keeps the voice identical on long text.
+        if skey == "instruct" and entry.get("profile"):
+            return "profile:" + str(entry["profile"])
+        return entry.get(skey, "")
+    cast = _tts_cast()
+    if cast:
+        if speaker:
+            entry = _tts_cast_lookup(cast, speaker)
+            voice = entry.get("voice", voice)
+            style = _sval(entry)
+        else:
+            narr = cast.get("narrator", {})
+            if not req_voice or req_voice == _tts.DEFAULT_VOICE:
+                voice = narr.get("voice", voice)
+            style = _sval(narr)
+        if voice not in _tts.VALID_VOICES:
+            voice = _tts.DEFAULT_VOICE
+    return voice, style
+
+
+def _tts_cache_path(text: str, voice: str, style: str) -> str:
+    import hashlib
+    key = hashlib.sha256(f"{_tts.engine_id()}|{voice}|{style}|{text}".encode()).hexdigest()
+    return os.path.join(rt("tts-cache"), key + ".pcm")
+
+
+def _tts_split(text: str, limit: int = 380) -> "list[str]":
+    """Split long narration into sentence groups so each Gemini call stays short
+    (long blocks time out or fail on the free tier)."""
+    sentences = re.split(r"(?<=[.!?”\"])\s+", text)
+    parts, cur = [], ""
+    for sn in sentences:
+        if cur and len(cur) + 1 + len(sn) > limit:
+            parts.append(cur)
+            cur = sn
+        else:
+            cur = (cur + " " + sn).strip()
+    if cur:
+        parts.append(cur)
+    return parts or [text]
+
+
+def _tts_get_or_make(text: str, voice: str, style: str) -> bytes:
+    parts = _tts_split(text)
+    if len(parts) > 1:
+        silence = bytes(14400)   # 0.3 s pause between parts (24 kHz, 16-bit mono)
+        return silence.join(_tts_get_or_make_one(p, voice, style) for p in parts)
+    return _tts_get_or_make_one(text, voice, style)
+
+
+# Quote characters that open/close spoken dialogue. Any of them toggles
+# in/out of a quote, which covers "..." (U+0022), “...” (U+201C/U+201D),
+# „...“ (U+201E/U+201C), ”...” (same mark both sides), ‟ and «...».
+# Single quotes are left alone so contractions ("don't") never split.
+_TTS_QUOTE_OPEN = "\"“”„‟«»"
+_TTS_QUOTE_CLOSE = "\"“”‟«»"
+
+
+# Inline speaker tag for dialogue inside narration: {Name} right before the
+# opening quote, e.g.  {Edda}"Someone humming at the Pithead," she says.
+# The tag is stripped before the text is shown or logged (see _tts_strip_tags)
+# and only steers which voice reads that quote.
+_TTS_TAG_RE = re.compile(r"\{([A-Za-z][\w .'\-]{0,40})\}")
+
+
+def _tts_strip_tags(text: str) -> str:
+    """Remove {Name} speaker tags so they never show on the page.
+    A tag before a quote goes with any spaces up to the quote; a stray tag
+    goes with the space before it, so no double spaces are left behind."""
+    name = _TTS_TAG_RE.pattern
+    text = re.sub(name + r"[ \t]*(?=[\"“”„‟«»])", "", text)
+    return re.sub(r"[ \t]?" + name, "", text)
+
+
+def _tts_segments(text: str) -> "list[tuple[str, bool, str]]":
+    """Split a block into [(text, is_dialogue, tag), ...] in reading order.
+
+    Text inside quotes is dialogue, text outside is narration. `tag` is the
+    {Name} written directly before that quote (spaces allowed between), or "".
+    A tag followed by anything other than a quote is ignored. An unclosed
+    quote runs to the end of the block (prose convention for dialogue that
+    continues across paragraphs). Quote marks themselves are dropped;
+    segments with no letters or digits (a stray comma between two quotes)
+    are skipped. Neighbours with the same kind and tag are merged.
+    """
+    segs: "list[tuple[str, bool, str]]" = []
+    buf: "list[str]" = []
+    inside = False
+    tag = ""        # tag of the quote being read
+    pending = ""    # tag seen, waiting for its opening quote
+
+    def flush() -> None:
+        s = "".join(buf).strip()
+        buf.clear()
+        if s and any(ch.isalnum() for ch in s):
+            segs.append((s, inside, tag if inside else ""))
+
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if not inside and ch == "{":
+            m = _TTS_TAG_RE.match(text, i)
+            if m:
+                pending = m.group(1).strip()
+                i = m.end()
+                continue
+        if (not inside and ch in _TTS_QUOTE_OPEN) or (inside and ch in _TTS_QUOTE_CLOSE):
+            flush()
+            if not inside:
+                tag, pending = pending, ""
+            inside = not inside
+            if not inside:
+                tag = ""
+        else:
+            if pending and not inside and not ch.isspace():
+                pending = ""          # tag not followed by a quote: ignore it
+            buf.append(ch)
+        i += 1
+    flush()
+    merged: "list[tuple[str, bool, str]]" = []
+    for s_, q, t in segs:
+        if merged and merged[-1][1] == q and merged[-1][2] == t:
+            merged[-1] = (merged[-1][0] + " " + s_, q, t)
+        else:
+            merged.append((s_, q, t))
+    return merged
+
+
+def _tts_trim(pcm: bytes, threshold: int = 350, keep_ms: int = 40) -> bytes:
+    """Trim leading/trailing near-silence from 24 kHz 16-bit mono PCM, keeping
+    a short margin, so joined segments don't leave dead air between voices."""
+    import array
+    a = array.array("h")
+    a.frombytes(pcm[: len(pcm) - (len(pcm) % 2)])
+    if sys.byteorder != "little":
+        a.byteswap()
+    n = len(a)
+    start = 0
+    while start < n and abs(a[start]) < threshold:
+        start += 1
+    if start >= n:
+        return pcm   # all quiet: leave untouched
+    end = n - 1
+    while end > start and abs(a[end]) < threshold:
+        end -= 1
+    keep = 24 * keep_ms
+    s, e = max(0, start - keep), min(n, end + 1 + keep)
+    return pcm[s * 2 : e * 2]
+
+
+def _tts_render(text: str, speaker: str, req_voice: str = "") -> "tuple[bytes, str]":
+    """Render a block to PCM, voicing each part with the right profile.
+
+    Speaker block (--npc): quotes in the speaker's voice (or the {Name} tagged
+    on that quote), the narration between quotes in the Narrator's voice.
+    Narrator block: everything in the Narrator's voice EXCEPT quotes tagged
+    {Name}, which use that character's voice. Untagged quotes stay Narrator;
+    nothing is guessed. Every segment is cached on its own
+    (_tts_get_or_make → per-sentence cache files), so repeated lines never
+    regenerate. Returns (pcm, primary_voice)."""
+    voice, style = _tts_pick(speaker, req_voice)
+    segs = _tts_segments(text)
+    plain = _tts_strip_tags(text)
+    if not segs:
+        return b"", voice
+    tagged = any(q and t for _, q, t in segs)
+    if not speaker and not tagged:
+        # Plain narration (untagged quotes included): one voice, as before.
+        return _tts_get_or_make(plain, voice, style), voice
+    if speaker and not any(q for _, q, _ in segs):
+        # No quote marks at all: the whole block is the speaker's line.
+        return _tts_get_or_make(plain, voice, style), voice
+
+    n_voice, n_style = _tts_pick("", req_voice)
+    parts: "list[tuple[str, str, str]]" = []     # (text, voice, style)
+    for seg, is_dialogue, tag in segs:
+        if is_dialogue and tag:
+            v, st = _tts_pick(tag, req_voice)
+        elif is_dialogue and speaker:
+            v, st = voice, style
+        elif is_dialogue:
+            v, st, seg = n_voice, n_style, f"\u201c{seg}\u201d"   # untagged quote: Narrator
+        else:
+            v, st = n_voice, n_style
+        if parts and parts[-1][1:] == (v, st):
+            parts[-1] = (parts[-1][0] + " " + seg, v, st)
+        else:
+            parts.append((seg, v, st))
+    if len(parts) == 1:
+        return _tts_get_or_make(parts[0][0], parts[0][1], parts[0][2]), voice
+    pause = bytes(2 * 24 * 180)   # 0.18 s breath at each voice change
+    out: "list[bytes]" = []
+    for seg, v, st in parts:
+        if out:
+            out.append(pause)
+        out.append(_tts_trim(_tts_get_or_make(seg, v, st)))
+    return b"".join(out), voice
+
+
+# Paragraphs that carried {Name} tags, kept so /tts can put the tags back:
+# the page only ever sees the stripped text and sends that back to /tts.
+# {normalised stripped paragraph: normalised tagged paragraph}, newest last.
+_TTS_TAGS_FILE = rt("tts_tags.json")
+_tts_tags_lock = threading.Lock()
+try:
+    with open(_TTS_TAGS_FILE, encoding="utf-8") as _f:
+        _tts_tags: "dict[str, str]" = dict(json.load(_f))
+except Exception:
+    _tts_tags = {}
+
+
+def _tts_remember_tags(tagged: str) -> str:
+    """Record a tagged paragraph and return its stripped (display) form."""
+    plain = _tts_strip_tags(tagged)
+    if plain != tagged:
+        k, v = _tts_norm(plain), _tts_norm(tagged)
+        with _tts_tags_lock:
+            _tts_tags.pop(k, None)
+            _tts_tags[k] = v
+            while len(_tts_tags) > 500:
+                _tts_tags.pop(next(iter(_tts_tags)))
+            snap = dict(_tts_tags)
+        try:
+            with open(_TTS_TAGS_FILE + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(snap, f)
+            os.replace(_TTS_TAGS_FILE + ".tmp", _TTS_TAGS_FILE)
+        except OSError:
+            pass
+    return plain
+
+
+def _tts_retag(text: str) -> str:
+    """Put remembered {Name} tags back into a block the page sent to /tts."""
+    with _tts_tags_lock:
+        pairs = list(_tts_tags.items())
+    for plain, tagged in pairs:
+        if plain and plain in text:
+            text = text.replace(plain, tagged)
+    return text
+
+
+def _tts_get_or_make_one(text: str, voice: str, style: str) -> bytes:
+    path = _tts_cache_path(text, voice, style)
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        if data:
+            return data
+    except OSError:
+        pass
+    pcm = _tts.synthesize_strict(text, voice, style=style)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".tmp", "wb") as f:
+            f.write(pcm)
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass
+    return pcm
+
+
+# Background voice prefetch: as soon as the DM sends narration or NPC lines,
+# generate the audio so it plays instantly when someone clicks it.
+_tts_prefetch_q: "queue.Queue[tuple[str, str]]" = queue.Queue(maxsize=200)
+
+
+def _tts_prefetch_worker() -> None:
+    import time as _t
+    while True:
+        text, speaker = _tts_prefetch_q.get()
+        try:
+            if not _tts or _tts.key_source() == "unset":
+                continue
+            for attempt in range(4):
+                try:
+                    _tts_render(text, speaker)
+                    break
+                except Exception as e:   # free-tier rate limit etc: wait and retry
+                    msg = str(e)
+                    if "429" in msg or "quota" in msg.lower() or "RESOURCE_EXHAUSTED" in msg:
+                        _t.sleep(20 * (attempt + 1))
+                        continue
+                    break
+        finally:
+            _tts_prefetch_q.task_done()
+
+
+def _tts_prefetch(text: str, speaker: str = "") -> None:
+    if not _tts or os.environ.get("DND_TTS_PREFETCH", "1") == "0":
+        return
+    t = _tts_norm(text)
+    if t:
+        try:
+            _tts_prefetch_q.put_nowait((t, speaker))
+        except queue.Full:
+            pass
+
+
+threading.Thread(target=_tts_prefetch_worker, daemon=True, name="tts-prefetch").start()
+
+
+def _tts_cast() -> dict:
+    """Voice casting from <data root>/voices.json (narrator + NPCs), or {}."""
+    root = os.environ.get("DND_CAMPAIGN_ROOT", os.path.expanduser("~/.claude/dnd"))
+    try:
+        with open(os.path.join(root, "voices.json"), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _tts_cast_lookup(cast: dict, speaker: str) -> dict:
+    npcs = cast.get("npcs", {}) or {}
+    low = speaker.lower()
+    for name, entry in npcs.items():
+        n = name.lower()
+        if n == low or n in low or low in n:
+            return entry
+    return cast.get("default_npc", {}) or {}
+
+
 @app.route("/tts", methods=["POST"])
 def tts_synthesize():
     """Synthesize a narrator/NPC block to L16 PCM.
@@ -1950,17 +2520,21 @@ def tts_synthesize():
     data = request.get_json(silent=True) or {}
     text = (data.get("text") or "").strip()
     voice = (data.get("voice") or _tts.DEFAULT_VOICE).strip()
+    speaker = str(data.get("speaker") or "").strip()[:60]
+    text = _tts_retag(_tts_norm(text))
     if not text:
         return "empty text", 400
-    if len(text) > _tts.MAX_TEXT_CHARS:
-        text = text[: _tts.MAX_TEXT_CHARS]
-    if voice not in _tts.VALID_VOICES:
-        voice = _tts.DEFAULT_VOICE
+    # Hosted table: every character has a fixed voice from voices.json; no per-listener pick.
+    req_voice = "" if _HOSTED else str(data.get("voice") or "")
     if _tts.key_source() == "unset":
         return "TTS not configured (see docs/SKILL-tts.md)", 503
     try:
-        pcm = _tts.synthesize_strict(text, voice)
+        pcm, voice = _tts_render(text, speaker, req_voice)
     except _tts.TtsError as e:
+        # Say plainly in the service log why voices failed (usually VoiceStudio
+        # on the DM's desktop is not running).
+        _msg = re.sub(r"(key=)[^&\s]+", r"\1<redacted>", str(e))
+        print(f"[tts] voice engine failed ({_tts.engine_id()}): {_msg}", file=sys.stderr, flush=True)
         return f"TTS upstream: {e}", 502
     return Response(
         pcm,
@@ -1971,6 +2545,29 @@ def tts_synthesize():
             "Cache-Control": "no-store",
         },
     )
+
+
+_tts_status_cache: dict = {"at": 0.0, "data": None}
+_tts_status_lock = threading.Lock()
+
+
+@app.route("/tts/status", methods=["GET"])
+def tts_status():
+    """Is the voice engine up? Polled by every page for the "Voices" light,
+    so the real check is cached for 20 s. Response: {engine, up, detail}."""
+    if _tts is None:
+        return jsonify({"engine": "", "up": False, "detail": "tts module unavailable"}), 200
+    if not _token_ok():
+        return "Forbidden", 403
+    import time as _t
+    with _tts_status_lock:
+        cached = _tts_status_cache["data"]
+        if cached is not None and _t.time() - _tts_status_cache["at"] < 20:
+            return jsonify(cached), 200
+    data = _tts.health()
+    with _tts_status_lock:
+        _tts_status_cache.update(at=_t.time(), data=data)
+    return jsonify(data), 200
 
 
 @app.route("/voice", methods=["POST"])
@@ -2035,6 +2632,8 @@ def help_request():
     so multiple players clicking the button never duplicates execution.
     Lock is released by dm_help.py in its finally block.
     """
+    if _HOSTED:
+        return "DM Help isn't available on the hosted table.", 503
     if not _token_ok():
         return "Forbidden", 403
 
@@ -2425,8 +3024,25 @@ def stage_input():
     if not _char_ok(character, known):
         return "Forbidden", 403
 
+    if _HOSTED and character == "Everybody":
+        global _proposal
+        me_char = ((g.dnd_user or {}).get("character") or "").strip() if getattr(g, "dnd_user", None) else ""
+        if not me_char:
+            return "Forbidden", 403
+        with _proposal_lock:
+            _proposal = {
+                "id": secrets.token_hex(6),
+                "text": text,
+                "by": me_char,
+                "votes": {me_char: {"vote": "yes", "note": ""}},
+                "ts": _time.time(),
+            }
+        if not _proposal_try_send():
+            _proposal_changed()
+        return "", 204
+
     # In solo mode (1 expected player), skip the manual Ready step and auto-trigger.
-    solo = (_expected_count == 1)
+    solo = (_expected_count == 1) or _HOSTED
 
     with _staged_lock:
         _staged[character] = {
@@ -2441,6 +3057,42 @@ def stage_input():
     if solo:
         _check_auto_trigger()
 
+    return "", 204
+
+
+@app.route("/proposal/vote", methods=["POST"])
+def proposal_vote():
+    """Agree or disagree with the open group proposal. Body: {id, vote: yes|no, note}"""
+    if not _HOSTED or not getattr(g, "dnd_user", None):
+        return "Forbidden", 403
+    me_char = (g.dnd_user.get("character") or "").strip()
+    data = request.get_json(force=True, silent=True) or {}
+    vote = "yes" if data.get("vote") == "yes" else "no"
+    note = _sanitize_input(str(data.get("note", "")))[:200] if vote == "no" else ""
+    if me_char not in _proposal_required():
+        return "You're not part of this vote.", 403
+    with _proposal_lock:
+        if not _proposal or _proposal.get("id") != str(data.get("id", "")):
+            return "That proposal is gone.", 409
+        _proposal["votes"][me_char] = {"vote": vote, "note": note}
+    if not _proposal_try_send():
+        _proposal_changed()
+    return "", 204
+
+
+@app.route("/proposal/withdraw", methods=["POST"])
+def proposal_withdraw():
+    """The proposer (or the owner) takes the group proposal back."""
+    if not _HOSTED or not getattr(g, "dnd_user", None):
+        return "Forbidden", 403
+    data = request.get_json(force=True, silent=True) or {}
+    me_char = (g.dnd_user.get("character") or "").strip()
+    with _proposal_lock:
+        p = _proposal
+        ok = p and p.get("id") == str(data.get("id", "")) and (p.get("by") == me_char or g.dnd_user.get("owner"))
+    if not ok:
+        return "Forbidden", 403
+    _proposal_clear()
     return "", 204
 
 
@@ -2502,6 +3154,79 @@ def unstage_input():
         snap = _staged_snapshot()
 
     _broadcast({"staged_inputs": snap})
+    return "", 204
+
+
+def _me_char() -> str:
+    u = getattr(g, "dnd_user", None) or {}
+    return (u.get("character") or "").strip()
+
+
+@app.route("/player-input/mine", methods=["GET"])
+def my_queued_inputs():
+    """Hosted: the logged-in player's own actions still waiting for the DM.
+
+    Response: {"character": str, "items": [{"i": line_index, "text": str}]}
+    Only lines for the player's own bound character are returned ("Everybody"
+    lines went through a group vote and are not editable by one player).
+    """
+    if not _HOSTED or not getattr(g, "dnd_user", None):
+        return "Forbidden", 403
+    me = _me_char()
+    items = []
+    if me:
+        with _queue_file_lock:
+            lines = _queue_read_lines()
+        for i, ln in enumerate(lines):
+            m = _QUEUE_LINE_RE.match(ln)
+            if m and m.group(1).lower() == me.lower():
+                items.append({"i": i, "text": m.group(2)})
+    return jsonify({"character": me, "items": items}), 200
+
+
+@app.route("/player-input/edit", methods=["POST"])
+def edit_queued_input():
+    """Hosted: change or withdraw one of your own actions before the DM reads it.
+
+    Body: {"i": line_index, "old": original_text, "text": new_text}
+    Empty "text" removes the action. 409 when the line is gone or changed
+    (usually because the DM already took the actions).
+    """
+    if not _HOSTED or not getattr(g, "dnd_user", None):
+        return "Forbidden", 403
+    if not _rate_ok(request.remote_addr):
+        return "Too Many Requests", 429
+    me = _me_char()
+    if not me:
+        return "Forbidden", 403
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        i = int(data.get("i"))
+    except (TypeError, ValueError):
+        return "Bad Request", 400
+    old = str(data.get("old", ""))
+    text = _sanitize_input(str(data.get("text", "")))
+    with _queue_file_lock:
+        lines = _queue_take()
+        if lines is None:
+            return "The DM already has this action.", 409
+        m = _QUEUE_LINE_RE.match(lines[i]) if 0 <= i < len(lines) else None
+        if not m or m.group(1).lower() != me.lower() or m.group(2) != old:
+            _queue_put(lines)   # unchanged
+            return "The DM already has this action.", 409
+        name = m.group(1)
+        if text:
+            lines[i] = f"[{name}]: {text}"
+        else:
+            del lines[i]
+        _queue_put(lines)
+        still_queued = any((mm := _QUEUE_LINE_RE.match(ln)) and mm.group(1) == name for ln in lines)
+    with _queue_status_lock:
+        if not still_queued and name in _queue_status:
+            _queue_status.remove(name)
+        qs = list(_queue_status)
+    # Every screen updates its checks; the editor's other tabs refetch their list.
+    _broadcast({"queue_status": qs})
     return "", 204
 
 
@@ -2611,6 +3336,9 @@ def stream():
         # Register this client's bound character (phones pass ?character=/?char=);
         # the main display passes neither. Drives dice-request phone-vs-screen routing.
         _ch = (request.args.get("character") or request.args.get("char") or "").strip().lower()[:48]
+        if _HOSTED:
+            _ch = _auth.viewer_char()
+            _client_viewer[q] = _ch
         if _ch:
             _client_chars[q] = _ch
 
@@ -2686,6 +3414,23 @@ def stream():
         for dev in list(_pending_devices.values()):
             q.put_nowait({"device_request": {"id": dev["id"], "ip": dev["ip"]}})
 
+    if _HOSTED:
+        # Filter everything queued above (replay, staged inputs, queue status)
+        # for this viewer before the stream starts.
+        _v = _client_viewer.get(q)
+        _initial = []
+        while True:
+            try:
+                _initial.append(q.get_nowait())
+            except queue.Empty:
+                break
+        for _p in _initial:
+            _fp = _auth.filter_for(_p, _v)
+            if _fp is not None:
+                q.put_nowait(_fp)
+        q.put_nowait({"party_mode": {"together": _auth.is_together()}})
+        q.put_nowait({"proposal": _proposal_view()})
+
     def generate():
         try:
             while True:
@@ -2701,6 +3446,7 @@ def stream():
                 except ValueError:
                     pass
                 _client_chars.pop(q, None)
+                _client_viewer.pop(q, None)
 
     resp = Response(
         generate(),
@@ -2715,6 +3461,12 @@ def stream():
     # emits both keep-alive (ours) and close (its default), which confuses
     # transparent proxies (e.g. eero mesh routing) into buffering the stream.
     resp.headers["Connection"] = "keep-alive"
+    if _HOSTED:
+        # Behind Caddy: Werkzeug already chunks the stream; a second manual
+        # Transfer-Encoding makes Caddy fail with "too many transfer encodings"
+        # (502). Hop-by-hop headers are the proxy's job anyway.
+        resp.headers.pop("Transfer-Encoding", None)
+        resp.headers.pop("Connection", None)
     return resp
 
 
@@ -2725,7 +3477,8 @@ if __name__ == "__main__":
     if _audio:
         _audio.set_broadcast(_broadcast)
 
-    host = "0.0.0.0" if _LAN_MODE else "localhost"
+    host = os.environ.get("DND_BIND", "").strip() or ("0.0.0.0" if _LAN_MODE else "localhost")
+    port = int(os.environ.get("DND_PORT", "5001"))
     # TLS — only enabled when --tls is explicitly passed; HTTP is the default.
     # Certs are runtime state (persist across plugin updates) → rt(); .scheme is a
     # launch-time marker read by simple shell commands → stays in the code dir.
@@ -2752,4 +3505,4 @@ if __name__ == "__main__":
         print(f"DnD DM Display — Flask server starting on {scheme}://localhost:5001")
         print(f"Open {scheme}://localhost:5001 in your browser, then Chromecast the tab.")
         print()
-    app.run(host=host, port=5001, threaded=True, debug=False, ssl_context=ssl_ctx)
+    app.run(host=host, port=port, threaded=True, debug=False, ssl_context=ssl_ctx)

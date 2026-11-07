@@ -90,7 +90,7 @@ if _DISPLAY_DIR not in sys.path:
 from runtime_paths import rt          # writable runtime dir (update-safe)
 _SCHEME_FILE = os.path.join(_DISPLAY_DIR, ".scheme")   # launch marker → code dir
 _SCHEME = open(_SCHEME_FILE, encoding="utf-8").read().strip() if os.path.exists(_SCHEME_FILE) else "http"
-FLASK_URL  = f"{_SCHEME}://localhost:5001/stats"
+FLASK_URL  = (os.environ.get("DND_DISPLAY_URL", "").rstrip("/") or f"{_SCHEME}://localhost:5001") + "/stats"
 TOKEN_FILE = rt(".token")
 TIMEOUT    = 2.0
 

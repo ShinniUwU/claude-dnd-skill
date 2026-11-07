@@ -161,6 +161,16 @@ def _resolve_node(data: dict, ref: str) -> Optional[str]:
     if len(prefix) > 1:
         ids = ", ".join(n["id"] for n in prefix)
         raise ValueError(f"name prefix '{ref}' matches multiple nodes: {ids}. use id directly.")
+    # Last resort: every word of the ref appears in the name, so "Ilse Varrow"
+    # finds "Madam Ilse Varrow" and "Sabine" finds "Mother Sabine Holt".
+    words = ref_low.split()
+    contains = [n for n in data["nodes"]
+                if words and all(w in n.get("name", "").lower().split() for w in words)]
+    if len(contains) == 1:
+        return contains[0]["id"]
+    if len(contains) > 1:
+        ids = ", ".join(n["id"] for n in contains)
+        raise ValueError(f"name '{ref}' matches multiple nodes: {ids}. use id directly.")
     return None
 
 

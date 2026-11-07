@@ -338,6 +338,12 @@ DNDEND
 ```
 Brief NPC interjections within narration don't need a separate block.
 
+*Speaker tags (voiced dialogue inside narration)* — the display reads each block aloud. In an `--npc` block, quotes use that NPC's voice and the text between quotes uses the Narrator's. In plain narration, **always** put `{Name}` directly before the opening quote of a line spoken by any character who has a voice profile in `<DATA root>/voices.json` (`npcs` keys, matched loosely). Tag every quote separately:
+```
+Edda taps her hammer twice. {Edda}"Someone humming at the Pithead," she says flatly. {Edda}"Nobody goes near it."
+```
+The tag is stripped before the text is shown or logged; it only picks the voice. Untagged quotes stay in the Narrator's voice (nothing is guessed). Don't tag player characters or characters without a profile (they'd get the generic NPC voice).
+
 *DM narration* — **CRITICAL:** compose the complete narration first, then call `send.py` as the very last action. Never call `send.py` mid-response. The send must contain the **complete, unabridged text** — do not summarize or condense. **Bundle all stat changes (HP, spell slots, conditions, concentration, inventory) into this same send.py call** using `--stat-*` flags — no separate `push_stats.py` call needed for turn-resolution state:
 ```bash
 # With stat changes (any HP/slot/condition that changed this turn):

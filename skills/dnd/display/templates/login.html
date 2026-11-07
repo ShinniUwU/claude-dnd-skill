@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Table</title>
+<link rel="icon" href="/favicon.ico">
+<style>
+  :root { --bg:#0b0f17; --panel:#141a26; --ink:#e8dcc0; --muted:#9a8f78; --gold:#c9a24a; --err:#e07a6a; }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; display:grid; place-items:center; padding:16px;
+         background:radial-gradient(ellipse at top, #18202f 0%, var(--bg) 70%); color:var(--ink);
+         font-family: Georgia, "Times New Roman", serif; }
+  .card { width:100%; max-width:380px; background:var(--panel); border:1px solid #3a3120;
+          border-radius:12px; padding:32px 28px; text-align:center; box-shadow:0 10px 40px #0008; }
+  h1 { font-weight:normal; letter-spacing:.12em; text-transform:uppercase; font-size:20px;
+       color:var(--gold); margin:0 0 8px; }
+  p { color:var(--muted); line-height:1.5; margin:0 0 24px; }
+  a.btn { display:inline-flex; align-items:center; gap:10px; background:#5865F2; color:#fff;
+          text-decoration:none; padding:12px 20px; border-radius:8px; font-family:system-ui, sans-serif;
+          font-weight:600; }
+  a.btn:hover { background:#4752c4; }
+  .err { color:var(--err); margin:0 0 20px; font-family:system-ui, sans-serif; font-size:14px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>The Table</h1>
+    <p>Sign in with Discord to take your seat.</p>
+    {% if error %}<div class="err">{{ error }}</div>{% endif %}
+    {% if login_url %}
+    <a class="btn" href="{{ login_url }}">
+      <svg width="20" height="16" viewBox="0 0 71 55" aria-hidden="true"><path fill="currentColor" d="M60.1 4.9A58.5 58.5 0 0 0 45.6.4a40 40 0 0 0-1.9 3.8 54 54 0 0 0-16.2 0A39 39 0 0 0 25.6.4 58.4 58.4 0 0 0 11 4.9C1.6 18.7-.9 32.1.3 45.4a58.9 58.9 0 0 0 17.9 9 42 42 0 0 0 3.8-6.2 38 38 0 0 1-6-2.9l1.5-1.1a42 42 0 0 0 36 0l1.5 1.1a38 38 0 0 1-6 2.9 42 42 0 0 0 3.8 6.2 58.7 58.7 0 0 0 17.9-9C72.2 30 68.3 16.7 60.1 4.9ZM23.7 37.3c-3.5 0-6.4-3.2-6.4-7.2s2.8-7.2 6.4-7.2 6.5 3.3 6.4 7.2c0 4-2.8 7.2-6.4 7.2Zm23.6 0c-3.5 0-6.4-3.2-6.4-7.2s2.8-7.2 6.4-7.2 6.5 3.3 6.4 7.2c0 4-2.8 7.2-6.4 7.2Z"/></svg>
+      Sign in with Discord
+    </a>
+    {% endif %}
+  </div>
+</body>
+</html>

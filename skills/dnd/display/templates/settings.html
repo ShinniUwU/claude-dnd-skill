@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Table Settings</title>
+<link rel="icon" href="/favicon.ico">
+<style>
+  :root { --bg:#0b0f17; --panel:#141a26; --line:#2c2a22; --ink:#e8dcc0; --muted:#9a8f78; --gold:#c9a24a; --err:#e07a6a; --ok:#7fb38a; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font-family:system-ui, sans-serif; padding:24px 16px; }
+  main { max-width:760px; margin:0 auto; }
+  header { display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:24px; }
+  h1 { font-family:Georgia, serif; font-weight:normal; color:var(--gold); letter-spacing:.1em; text-transform:uppercase; font-size:20px; margin:0; }
+  h2 { font-size:14px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); margin:28px 0 10px; }
+  a { color:var(--gold); }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  th { color:var(--muted); font-weight:500; font-size:13px; }
+  td code { color:var(--muted); font-size:12px; }
+  input, select { width:100%; background:#0e131d; color:var(--ink); border:1px solid #3a3a3a; border-radius:6px; padding:8px; font:inherit; }
+  button { background:transparent; color:var(--gold); border:1px solid var(--gold); border-radius:6px; padding:8px 12px; font:inherit; cursor:pointer; white-space:nowrap; }
+  button.danger { color:var(--err); border-color:var(--err); }
+  button:disabled { opacity:.4; cursor:default; }
+  .row { display:grid; grid-template-columns: 1.4fr 1fr 1fr auto; gap:8px; align-items:end; }
+  .row label { font-size:12px; color:var(--muted); display:block; margin-bottom:4px; }
+  .toggle { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+  .hint { color:var(--muted); font-size:13px; line-height:1.5; margin:8px 0 0; }
+  #msg { min-height:20px; margin-top:12px; font-size:14px; }
+  #msg.err { color:var(--err); } #msg.ok { color:var(--ok); }
+  @media (max-width:600px) {
+    .row { grid-template-columns:1fr; }
+    thead { display:none; }
+    tr { display:grid; grid-template-columns:1fr 1fr; gap:6px; padding:10px 0; border-bottom:1px solid var(--line); }
+    td { border:0; padding:2px 0; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Table Settings</h1>
+    <div><a href="/">Back to the table</a> · <a href="/logout">Log out</a></div>
+  </header>
+
+  <h2>Party</h2>
+  <section>
+    <strong id="party-label">{{ 'Together' if access.together else 'Split up' }}</strong>
+    <p class="hint">The DM decides this from what happens in the story.<br>
+       Together: everyone sees everything and can act as "Everybody".
+       Split up: each player only acts as their own character, and the DM can send scenes to just one person.</p>
+  </section>
+
+  <h2>Who can sit at the table</h2>
+  <section>
+    <table>
+      <thead><tr><th>Name</th><th>Discord ID</th><th>Character</th><th></th></tr></thead>
+      <tbody id="users">
+      {% for uid, u in access.users.items() %}
+        <tr data-id="{{ uid }}">
+          <td><input class="u-name" value="{{ u.name }}" maxlength="40" aria-label="Name"></td>
+          <td><code>{{ uid }}</code>{% if uid == owner_id %} <span class="hint">(owner)</span>{% endif %}</td>
+          <td><input class="u-char" list="chars" value="{{ u.character }}" maxlength="50" aria-label="Character"></td>
+          <td style="display:flex;gap:6px">
+            <button type="button" class="save">Save</button>
+            {% if uid != owner_id %}<button type="button" class="danger remove">Remove</button>{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+
+    <h2>Add someone</h2>
+    <div class="row">
+      <div><label for="new-id">Discord user ID</label><input id="new-id" inputmode="numeric" placeholder="e.g. 835864829586833408"></div>
+      <div><label for="new-name">Name</label><input id="new-name" maxlength="40" placeholder="Chloe"></div>
+      <div><label for="new-char">Character</label><input id="new-char" list="chars" maxlength="50" placeholder="Maren Ashgrove"></div>
+      <button id="add-btn" type="button">Add</button>
+    </div>
+    <p class="hint">To find a Discord ID: Discord Settings, Advanced, turn on Developer Mode, then right-click the person and pick "Copy User ID".
+       A new character name works too, for future campaigns.</p>
+    <datalist id="chars">{% for c in characters %}<option value="{{ c }}">{% endfor %}</datalist>
+    <div id="msg" role="status"></div>
+  </section>
+</main>
+<script>
+const msg = document.getElementById('msg');
+function say(text, ok) { msg.textContent = text; msg.className = ok ? 'ok' : 'err'; }
+async function post(body) {
+  const r = await fetch('/settings/users', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  if (!r.ok) { say(await r.text(), false); return null; }
+  return r.json();
+}
+document.querySelectorAll('#users tr').forEach(tr => {
+  const id = tr.dataset.id;
+  tr.querySelector('.save').onclick = async () => {
+    const ok = await post({action:'update', id, name: tr.querySelector('.u-name').value, character: tr.querySelector('.u-char').value});
+    if (ok) say('Saved.', true);
+  };
+  const rm = tr.querySelector('.remove');
+  if (rm) rm.onclick = async () => {
+    if (!confirm('Remove this person from the table? They lose access straight away.')) return;
+    if (await post({action:'remove', id})) tr.remove(), say('Removed.', true);
+  };
+});
+document.getElementById('add-btn').onclick = async () => {
+  const id = document.getElementById('new-id').value.trim();
+  const ok = await post({action:'add', id, name: document.getElementById('new-name').value, character: document.getElementById('new-char').value});
+  if (ok) location.reload();
+};
+</script>
+</body>
+</html>

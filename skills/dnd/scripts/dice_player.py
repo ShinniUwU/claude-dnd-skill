@@ -45,7 +45,7 @@ try:
         _SCHEME = f.read().strip() or "http"
 except FileNotFoundError:
     _SCHEME = "http"
-_BASE       = f"{_SCHEME}://localhost:5001"
+_BASE       = os.environ.get("DND_DISPLAY_URL", "").rstrip("/") or f"{_SCHEME}://localhost:5001"
 _DICE_REQ   = f"{_BASE}/dice-request"
 _TEXT_LOG   = os.path.join(str(_runtime_dir()), "text_log.json")
 

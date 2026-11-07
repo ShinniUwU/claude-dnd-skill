@@ -76,7 +76,7 @@ if _DISPLAY_DIR not in sys.path:
 from runtime_paths import rt          # writable runtime dir (update-safe)
 _SCHEME_FILE = os.path.join(_DISPLAY_DIR, ".scheme")   # launch marker → code dir
 _SCHEME = open(_SCHEME_FILE, encoding="utf-8").read().strip() if os.path.exists(_SCHEME_FILE) else "http"
-BASE_URL    = f"{_SCHEME}://localhost:5001"
+BASE_URL    = os.environ.get("DND_DISPLAY_URL", "").rstrip("/") or f"{_SCHEME}://localhost:5001"
 FLASK_URL   = f"{BASE_URL}/chunk"
 STATS_URL   = f"{BASE_URL}/stats"
 HEALTH_URL  = f"{BASE_URL}/health"
@@ -113,6 +113,22 @@ def _endpoint_label(url: str) -> str:
     if url.endswith("/stats"):  return "stats"
     if url.endswith("/health"): return "health"
     return url.rsplit("/", 1)[-1] or url
+
+
+def _party_split(party_flag: "str | None") -> bool:
+    """True when the hosted table is split. A --party flag in the same call
+    wins; otherwise read <DND_CAMPAIGN_ROOT>/access.json. Not hosted (no
+    access.json) -> False, so the stock single-screen setup is unaffected."""
+    if party_flag:
+        return party_flag == "split"
+    root = os.environ.get("DND_CAMPAIGN_ROOT", "").strip()
+    if not root:
+        return False
+    try:
+        with open(os.path.join(root, "access.json"), encoding="utf-8") as f:
+            return json.load(f).get("together", True) is False
+    except (OSError, ValueError):
+        return False
 
 
 def _post(url: str, data: bytes, token: str) -> bool:
@@ -464,12 +480,25 @@ def main() -> None:
     parser.add_argument("--effect-end", action="append", metavar="NAME:SPELL",
         help="End a timed effect: NAME:SPELL (narrative end — broken, dispelled, player drops)")
 
+    # ── Multiplayer privacy (hosted fork) ─────────────────────────────────────
+    parser.add_argument("--to", metavar="NAMES",
+        help='Private send: comma-separated character names who may see this block '
+             '(e.g. --to "Maren Ashgrove"). Omit to show it to everyone.')
+    parser.add_argument("--party", choices=["together", "split"],
+        help="Set party mode. together = everyone sees everything and can act as Everybody; "
+             "split = each player only acts as their own character.")
+    parser.add_argument("--all", action="store_true",
+        help="While the party is split, deliberately send this block to everyone. "
+             "Without --to or --all, split-mode sends are refused so a private scene "
+             "can't leak by accident.")
+
     # ── Diagnostics ───────────────────────────────────────────────────────────
     parser.add_argument("--verify", action="store_true",
         help="After sending, GET /health and confirm the broadcast was received. "
              "Surfaces a clear stderr line on mismatch — use during dev/debug.")
 
     args = parser.parse_args()
+    _to = [n.strip() for n in (args.to or "").split(",") if n.strip()]
 
     # Two categories of flags drive whether to read stdin:
     #   1. Content flags (--player/--npc/--dice/--tutor/--action): body REQUIRED.
@@ -562,7 +591,32 @@ def main() -> None:
     if _has_content_flag:
         text = sys.stdin.read()
     else:
-        text = "" if sys.stdin.isatty() else sys.stdin.read()
+        # Body optional. Under a non-TTY harness (e.g. Claude Code's Bash tool)
+        # stdin can be an open pipe that never sends EOF, so a bare
+        # `send.py --party together` would block forever. Only read when data
+        # is actually waiting (heredocs/pipes are ready immediately).
+        text = ""
+        if not sys.stdin.isatty():
+            try:
+                import select
+                ready, _, _ = select.select([sys.stdin], [], [], 0.5)
+            except (OSError, ValueError):
+                ready = [sys.stdin]  # e.g. Windows pipes: fall back to plain read
+            if ready:
+                text = sys.stdin.read()
+
+    # ── Split-mode privacy guard (hosted) ────────────────────────────────────
+    # While the party is split, every visible block (narration, NPC, dice,
+    # tutor, player echo, awards) must say who it is for. Refuse before
+    # anything is posted, so a refused call sends nothing at all.
+    _visible = bool(text.strip()) or bool(args.xp_award or args.inspiration_award
+                                          or args.milestone_award)
+    if _visible and not _to and not args.all and _party_split(args.party):
+        print("send.py: REFUSED - the party is split, so this block needs --to \"<Character>\" "
+              "(or --all to show it to everyone on purpose). Nothing was sent.",
+              file=sys.stderr)
+        sys.exit(3)
+
     token = _read_token()
 
     # ── Inspiration award/spend ──────────────────────────────────────────────
@@ -570,9 +624,14 @@ def main() -> None:
     # through to the text-send block below. Bundling a heredoc body with an
     # award flag now broadcasts BOTH the gold block AND the narration chunk —
     # previously the narration was silently dropped by an early return here.
+    if args.party:
+        _post(f"{BASE_URL}/party-mode", json.dumps({"together": args.party == "together"}).encode(), token)
+
     if args.inspiration_award:
         name = args.inspiration_award.strip()
         body: dict = {"inspiration_award": name, "text": name}
+        if _to:
+            body["to"] = _to
         if args.inspiration_reason:
             body["reason"] = args.inspiration_reason.strip()
         _post(FLASK_URL, json.dumps(body).encode(), token)
@@ -590,6 +649,8 @@ def main() -> None:
         name = args.milestone_award.strip()
         label = (args.milestone_label or "Milestone").strip()
         m_body: dict = {"milestone_award": name, "text": name, "label": label}
+        if _to:
+            m_body["to"] = _to
         if args.milestone_reason:
             m_body["reason"] = args.milestone_reason.strip()
         _post(FLASK_URL, json.dumps(m_body).encode(), token)
@@ -619,7 +680,10 @@ def main() -> None:
             amt   = xp_data.get("xp", 0)
             rsn   = xp_data.get("reason", "")
             xp_data["summary"] = f"{names} — {amt} XP" + (f" ({rsn})" if rsn else "")
-        _post(FLASK_URL, json.dumps({"xp_award": xp_data, "text": xp_data["summary"]}).encode(), token)
+        _xp_body = {"xp_award": xp_data, "text": xp_data["summary"]}
+        if _to:
+            _xp_body["to"] = _to
+        _post(FLASK_URL, json.dumps(_xp_body).encode(), token)
 
     # ── Pre-flight integrity check ────────────────────────────────────────────
     # If a content flag is set but no text arrived on stdin, that's almost
@@ -654,6 +718,8 @@ def main() -> None:
                 payload["dice"] = True
             elif args.tutor:
                 payload["tutor"] = True
+            if _to:
+                payload["to"] = _to
 
             issues = _validate_payload(payload, "chunk")
             if issues:
